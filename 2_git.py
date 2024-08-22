@@ -353,7 +353,7 @@ class MainWidget(QWidget):
                     time.sleep(0.05)
 
                 self.still_image_ready = False
-                image1 = np.frombuffer(self.buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
+                image1 = np.frombuffer(self.snap_buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
                 gray_image1 = auto_focus.rgb_to_gray(image1)
 
                 self.send_gcommand(f"G91 G1 Z{delta_u} F31000")
@@ -401,7 +401,7 @@ class MainWidget(QWidget):
                 time.sleep(0.05)
 
             self.still_image_ready = False
-            image = np.frombuffer(self.buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
+            image = np.frombuffer(self.snap_buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
             gray_image = auto_focus.rgb_to_gray(image)
             new_FV = auto_focus.calculate_FV(gray_image)
 
@@ -492,13 +492,11 @@ class MainWidget(QWidget):
     def handleStillImageEvent(self):
         info = toupcam.ToupcamFrameInfoV3()
         try:
-            self.hcam.PullStillImageV2(self.pData, 24, None, info) # 获取静态图像
+            self.hcam.PullStillImageV2(self.snap_buf, 24, None, info) # 获取静态图像
         except toupcam.HRESULTException:
             pass
         else:
-            image = QImage(self.pData, info.width, info.height, QImage.Format_RGB888)
-            self.count += 1
-            image.save(f"pyqt_still_{self.count}.jpg")
+            print("Snap data accepted")
 
     def send_gcommand(self, command):
         ser.write(command.encode())
