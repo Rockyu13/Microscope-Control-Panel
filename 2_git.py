@@ -90,6 +90,8 @@ class MainWidget(QWidget):
         self.temp = toupcam.TOUPCAM_TEMP_DEF
         self.tint = toupcam.TOUPCAM_TINT_DEF
         self.count = 0
+        self.realtime = 0
+        self.still_image_ready = False
 
         gboxres = QGroupBox("Resolution")
         self.cmb_res = QComboBox()
@@ -295,6 +297,7 @@ class MainWidget(QWidget):
                 self.cmb_res.setEnabled(True)
             self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0) #Qimage use RGB byte order
             self.hcam.put_AutoExpoEnable(1)
+            self.hcam.put_RealTime(1)
             self.startCamera()
 
     def onBtnOpen(self):
@@ -348,26 +351,25 @@ class MainWidget(QWidget):
                 self.hcam.Snap(1)
                 start_time = time.time()
                 while not self.still_image_ready:
-                    if time.time() - start_time > 5:
+                    if time.time() - start_time > 1:
                         raise RuntimeError("Timeout waiting for still image")
-                    time.sleep(0.05)
-
+                    time.sleep(0.01)
                 self.still_image_ready = False
                 image1 = np.frombuffer(self.snap_buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
                 gray_image1 = auto_focus.rgb_to_gray(image1)
 
                 self.send_gcommand(f"G91 G1 Z{delta_u} F31000")
-                time.sleep(0.05)
+                time.sleep(0.1)
 
                 self.hcam.Snap(1)
                 start_time = time.time()
                 while not self.still_image_ready:
-                    if time.time() - start_time > 5:
+                    if time.time() - start_time > 1:
                         raise RuntimeError("Timeout waiting for still image")
-                    time.sleep(0.05)
+                    time.sleep(0.01)
 
                 self.still_image_ready = False
-                image2 = np.frombuffer(self.buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
+                image2 = np.frombuffer(self.snap_buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
                 gray_image2 = auto_focus.rgb_to_gray(image2)
 
                 u_real_max_min = auto_focus.max_dfd(gray_image1, gray_image2, delta_u)
