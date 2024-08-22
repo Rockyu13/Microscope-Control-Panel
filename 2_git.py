@@ -348,12 +348,17 @@ class MainWidget(QWidget):
             u_real_max_min = float('inf')
 
             while u_real_max_min > threshold:
-                self.hcam.Snap(1)
+                hresult = self.hcam.Snap(1)
+                if hresult != 0:
+                    raise RuntimeError(f"Snap failed with HRESULT: {hresult} at getting figure 1")
+                hresult = 0
+                
                 start_time = time.time()
                 while not self.still_image_ready:
                     if time.time() - start_time > 1:
                         raise RuntimeError("Timeout waiting for still image")
                     time.sleep(0.01)
+                
                 self.still_image_ready = False
                 image1 = np.frombuffer(self.snap_buf, dtype=np.uint8).reshape((self.hcam.get_Size()[1], self.hcam.get_Size()[0], 3))
                 gray_image1 = auto_focus.rgb_to_gray(image1)
@@ -361,7 +366,11 @@ class MainWidget(QWidget):
                 self.send_gcommand(f"G91 G1 Z{delta_u} F31000")
                 time.sleep(0.1)
 
-                self.hcam.Snap(1)
+                hresult = self.hcam.Snap(1)
+                if hresult != 0:
+                    raise RuntimeError(f"Snap failed with HRESULT: {hresult} at getting figure 2")
+                hresult = 0
+                
                 start_time = time.time()
                 while not self.still_image_ready:
                     if time.time() - start_time > 1:
@@ -373,7 +382,7 @@ class MainWidget(QWidget):
                 gray_image2 = auto_focus.rgb_to_gray(image2)
 
                 u_real_max_min = auto_focus.max_dfd(gray_image1, gray_image2, delta_u)
-                delta_u = u_real_max_min / 10  # 根据粗逼近结果调整步长
+                delta_u = u_real_max_min / 10  
 
             # 细调步骤
             gray_images.append(gray_image1)
