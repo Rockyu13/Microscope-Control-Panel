@@ -422,16 +422,18 @@ class MainWidget(QWidget):
         except toupcam.HRESULTException:
             pass
         else:
-            image = QImage(self.pData, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
-            
-            #save last image for later use
-            self.last_image = np.frombuffer(self.pData,dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3)
+            image_copy = np.frombuffer(self.pData, dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3).copy()
+            self.display_image(image_copy)
+            self.last_image = image_copy
             if (self.last_image is not None) and (self.last_image_flag == 0): #Check if it is activated
                 print('Last image activated')
                 self.last_image_flag = 1
 
-            newimage = image.scaled(self.lbl_video.width(), self.lbl_video.height(), Qt.KeepAspectRatio, Qt.FastTransformation)
-            self.lbl_video.setPixmap(QPixmap.fromImage(newimage))
+            
+    def display_image(self, image):
+        qimage = QImage(image, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage)
+        self.lbl_video.setPixmap(pixmap)
 
     def handleExpoEvent(self):
         time = self.hcam.get_ExpoTime()
