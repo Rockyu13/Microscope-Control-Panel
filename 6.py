@@ -389,22 +389,30 @@ class MainWidget(QWidget):
         z_displacement = first_step
         l_var = np.zeros((3,), dtype=np.float64)
         count = 0
+        direction = 1
+        best_var = 0
+        distance_from_best = 0
 
         image = self.last_image.copy()
         gray_image = auto_focus.rgb_to_gray(image)
         l_var[-1] = auto_focus.laplacian_variance(gray_image)
         print(f"Initial Laplacian Variance: {l_var[-1]:.6f}")
+        best_var = l_var[-1]
 
         if self.hcam:
             for i in range(max_iteration):
                 if not self.focus_thread.is_running:
                     break
 
-                self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
+                self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                #distance_from_best += z_displacement
                 time.sleep(0.3)
                 image = self.last_image.copy()
                 gray_image = auto_focus.rgb_to_gray(image)
                 laplacian_variance = auto_focus.laplacian_variance(gray_image)
+                #if laplacian_variance > best_var:
+                    #best_var = laplacian_variance
+                    #distance_from_best = 0
                 l_var[:-1] = l_var[1:]
                 l_var[-1] = laplacian_variance
                 print(f"Iteration: {i}, Laplacian Variance: {laplacian_variance:.6f}")
@@ -413,19 +421,16 @@ class MainWidget(QWidget):
                     if l_var[2] >= l_var[1]:
                         print("first step direction correct")
                     else:
-                        z_displacement = - z_displacement
+                        direction = - direction
                         print("first step direction incorrect")
                 else:
-                    if l_var[2] < l_var[1]:
-                        z_displacement = - z_displacement
-                        print("direction incorrect")
                     if l_var[1] >= l_var[0] and l_var[1] >= l_var[2]:
                         if abs(z_displacement) > min_step:
                             self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
                             time.sleep(0.3)
                             l_var[1], l_var[2] = l_var[2], l_var[1]
-                            z_displacement = - z_displacement / 1.5
-                            
+                            direction = - direction
+                            z_displacement = z_displacement / 2
                             print("go back with halved step")
                             continue
                         if abs(z_displacement) <= min_step:
@@ -433,6 +438,9 @@ class MainWidget(QWidget):
                             self.send_gcommand(f'$J=G91Z{-z_displacement}F30000\n')
                             print("Focus operation completed")
                             return
+                    elif l_var[2]<l_var[1]:
+                        direction = - direction
+                        continue
                     else:
                         continue
 
