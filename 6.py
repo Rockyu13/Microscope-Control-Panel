@@ -80,7 +80,7 @@ class FocusThread(QThread):
         #self.main_widget.rough_approach(100, 50, 10)  # 添加 rough_approach 调用
         #self.main_widget.fine_approach(5, 20)
         #self.main_widget.fine_approach(1, 10)
-        self.main_widget.climb_hill_focus(100, 1, 30)
+        self.main_widget.climb_hill_focus(100, 10, 20)
         self.finished.emit()
 
     def stop(self):
@@ -416,18 +416,25 @@ class MainWidget(QWidget):
                         z_displacement = - z_displacement
                         print("first step direction incorrect")
                 else:
+                    if l_var[2] < l_var[1]:
+                        z_displacement = - z_displacement
+                        print("direction incorrect")
                     if l_var[1] >= l_var[0] and l_var[1] >= l_var[2]:
-                        if z_displacement > min_step:
-                            z_displacement = z_displacement / 2
-                        else:
+                        if abs(z_displacement) > min_step:
+                            self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
+                            time.sleep(0.3)
+                            l_var[1], l_var[2] = l_var[2], l_var[1]
+                            z_displacement = - z_displacement / 1.5
+                            
+                            print("go back with halved step")
+                            continue
+                        if abs(z_displacement) <= min_step:
+                            print(f"z_displacement = {z_displacement} um")
                             self.send_gcommand(f'$J=G91Z{-z_displacement}F30000\n')
                             print("Focus operation completed")
                             return
                     else:
                         continue
-        
-        print("Not fully focused")
-        return
 
     def rough_approach(self, first_step, threshold, n):
         auto_focus = AutoFocus()
