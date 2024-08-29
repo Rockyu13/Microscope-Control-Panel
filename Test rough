@@ -1,0 +1,100 @@
+import sys
+import toupcam
+import numpy as np
+import cv2
+import time
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication, QWidget, QMessageBox
+
+class AutoFocus:
+    def rgb_to_gray(self, image):
+        gray_image = np.dot(image[..., :3], [38, 75, 15]) >> 7
+        return gray_image.astype(np.uint8)
+
+    def max_dfd(self, gray_image1, gray_image2, delta_u):
+        V1 = gray_image1.astype(np.float32)
+        V2 = gray_image2.astype(np.float32)
+        ratio = np.sqrt(V2 / (V1 + 1e-10)) 
+        safe_ratio = np.clip(ratio, 1e-10, 1 - 1e-10)
+        u_real_max = delta_u * safe_ratio / (1 - safe_ratio)
+        u_real_max_min = np.min(u_real_max)
+        return u_real_max_min
+
+class TestProgram(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.hcam = None
+        self.imgWidth = 0
+        self.imgHeight = 0
+        self.pData = None
+        self.image1 = None
+        self.image2 = None
+        self.init_camera()
+    
+    def init_camera(self):
+        arr = toupcam.Toupcam.EnumV2()
+        if len(arr) == 0:
+            QMessageBox.warning(self, "Warning", "No camera found.")
+            sys.exit()
+        self.cur = arr[0]
+        self.hcam = toupcam.Toupcam.Open(self.cur.id)
+        if self.hcam:
+            self.res = 1  # 设置分辨率 index 为 1
+            self.imgWidth = self.cur.model.res[self.res].width
+            self.imgHeight = self.cur.model.res[self.res].height
+            self.hcam.put_eSize(self.res)
+            self.pData = np.zeros((self.imgHeight, self.imgWidth, 3), dtype=np.uint8)
+            self.hcam.StartPullModeWithCallback(self.eventCallBack, self)
+
+    def eventCallBack(self, nEvent):
+        self.handleImageEvent()
+
+    def handleImageEvent(self):
+        try:
+            self.hcam.PullImageV3(self.pData, 0, 24, 0, None)
+        except toupcam.HRESULTException:
+            pass
+
+    def capture_image(self):
+        self.handleImageEvent()
+        return self.pData.copy()
+
+    def move_z_axis(self, z_position):
+        # 模拟移动 Z 轴，实际操作应发送控制命令到硬件
+        print(f"Moving Z axis by {z_position}um")
+        # 示例：发送 G 代码指令到控制器
+        # command = f"G91 G1 Z{z_position} F3000"
+        # ser.write(command.encode())
+        # ser.flush()
+
+    def save_image(self, image, filename):
+        cv2.imwrite(filename, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        print(f"Image saved as {filename}")
+
+    def calculate_max_dfd(self):
+        auto_focus = AutoFocus()
+        gray_image1 = auto_focus.rgb_to_gray(self.image1)
+        gray_image2 = auto_focus.rgb_to_gray(self.image2)
+        max_dfd_value = auto_focus.max_dfd(gray_image1, gray_image2, delta_u=100)
+        print(f"Max DFD Value: {max_dfd_value:.6f} m")
+
+    def run_test(self):
+        # 拍摄第一张图片
+        self.image1 = self.capture_image()
+        self.save_image(self.image1, "image1.png")
+
+        # 移动 Z 轴
+        self.move_z_axis(100)
+
+        # 拍摄第二张图片
+        self.image2 = self.capture_image()
+        self.save_image(self.image2, "image2.png")
+
+        # 计算 max_dfd
+        self.calculate_max_dfd()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    test_program = TestProgram()
+    test_program.run_test()
+    sys.exit(app.exec_())
