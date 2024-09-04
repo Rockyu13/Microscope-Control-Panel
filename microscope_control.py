@@ -20,47 +20,6 @@ class AutoFocus:
         gray_image = np.dot(image[..., :3], [38, 75, 15]) >> 7
         return gray_image.astype(np.uint8)
 
-    def max_dfd(self, gray_image1, gray_image2, delta_u):
-        V1 = gray_image1.astype(np.float32)
-        V2 = gray_image2.astype(np.float32)
-        ratio = np.sqrt(V2 / (V1 + 1e-10))
-
-        u_real_max = delta_u * ratio / (1 - ratio)
-        u_real_max_min = np.min(u_real_max)
-
-        print(f"Min of Max DFD: {u_real_max_min:.6f} m")
-        return u_real_max_min
-
-    def calculate_FV(self, gray_image):
-        alpha = 0.5
-        _, otsu_threshold = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        T = alpha * otsu_threshold
-
-        kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]])
-        variance = cv2.filter2D(gray_image.astype(np.float32), -1, kernel)
-
-        max_gradient = self.calculate_max_gradient(gray_image)
-
-        mask = variance > T
-        weighted_gradients = max_gradient[mask] ** 2
-        FV = np.sum(weighted_gradients)
-
-        return FV
-
-    def calculate_max_gradient(self, gray_image):
-        W1 = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        W2 = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        W3 = np.array([[0, 1, 2], [-1, 0, 1], [-2, -1, 0]])
-        W4 = np.array([[-2, -1, 0], [-1, 0, 1], [0, 1, 2]])
-
-        G1 = np.abs(cv2.filter2D(gray_image, -1, W1))
-        G2 = np.abs(cv2.filter2D(gray_image, -1, W2))
-        G3 = np.abs(cv2.filter2D(gray_image, -1, W3))
-        G4 = np.abs(cv2.filter2D(gray_image, -1, W4))
-
-        max_gradient = np.maximum(np.maximum(G1, G2), np.maximum(G3, G4))
-        return max_gradient
-
     def laplacian_variance(self, gray_image):
         """Calculate the variance of the Laplacian, which indicates the sharpness of the image."""
         laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
@@ -69,7 +28,6 @@ class AutoFocus:
 
 class FocusThread(QThread):
     finished = pyqtSignal()
-    update_image_signal = pyqtSignal(np.ndarray)
 
     def __init__(self, main_widget):
         super().__init__()
@@ -82,7 +40,6 @@ class FocusThread(QThread):
 
     def stop(self):
         self.is_running = False
-
 
 class PositionWorker(QThread):
     update_position = pyqtSignal(float, float, float)
@@ -98,6 +55,14 @@ class PositionWorker(QThread):
         self.x_pos = 0.0
         self.y_pos = 0.0
         self.z_pos = 0.0
+        self.flag = 1
+        self.cancel = 0
+        self.move = 0
+        self.home = 0
+        self.alarmed = 0
+        self.x_min, self.x_max = 0, 1023
+        self.y_min, self.y_max = 0, 1023
+        self.z_min, self.z_max = 0, 1023
 
     def run(self):
         self.running = True
@@ -105,20 +70,231 @@ class PositionWorker(QThread):
         ser.reset_output_buffer()
         time.sleep(0.1)
 
+        # Set reporting mask to 1
+        self.send_gcode_command('$10=1\n')
+        
+        # 8/11/2024 Yuan: make sure it stays ON at initialization
+        self.send_keep_on()
+        self.flag = 1
+        time_step = 0.04 # Yuan 8/11
+        last_time = time.time()
+        time_started = last_time
         while self.running:
             data = self.read_hid_data()
             if data:
-                self.update_position.emit(self.x_pos, self.y_pos, self.z_pos)
-                time.sleep(0.04)
+                keyboard_input = self.check_keyboard(data)
+                if keyboard_input == 1 and self.flag != 1:
+                    self.send_keep_on()
+                    self.flag = 1
+                    print('on1')
+                elif keyboard_input == 2 and self.flag != 2:
+                    self.send_keep_off()
+                    self.flag = 2
+                    print('off')
+                
+                if keyboard_input == 5 and self.home == 0:
+                    self.send_homing_command()
+                    self.home = 1
 
+                if keyboard_input == 7 and self.alarmed == 1:
+                    self.send_reset_alarm()
+                    self.alarmed = 0
+
+                x = self.parse_axis_data(data[0], data[1])
+                y = self.parse_axis_data(data[2], data[3])
+                z = self.parse_axis_data(data[4], data[5])
+
+                x = self.x_map(x)
+                y = self.y_map(y)
+                z = self.z_map(z)
+
+                # Yuan edit 8/11/2024: Check of cancel flag is moved inside. Otherwise the program keeps sending zero jogs even when joystick not moving
+                # If in alarmed status, no more moving
+                if (abs(x - 0x0200) < 0x0020 and abs(y - 0x0200) < 0x0020 and abs(z - 0x0200) < 0x0010) or self.alarmed:
+                    if self.cancel == 0:
+                        ser.reset_input_buffer()
+                        self.send_jog_cancel()
+                        self.update_position_from_device() # Yuan 8/11/2024: update once jog has stopped
+                        self.cancel = 1
+                        time.sleep(0.1) # Yuan 8/11/2024: simply add a wait. This could be done better by checking "Idle" status
+                    #print('no move')
+                else:  # Yuan 8/11/2024 changed to if/else so that there will be 20ms delay even if no move
+                    print('move')
+                    gcode_command = self.process_data(x, y, z)
+                    if gcode_command:
+                        # 8/11/2024 Yuan: make sure it stays ON once a move has been issued
+                        if self.flag != 1:
+                            self.send_keep_on()
+                            self.flag = 1
+
+                        self.send_gcode_command(gcode_command, False)
+                        self.cancel = 0
+                        self.move = 1
+                        self.home = 0
+
+                        status = self.send_status_request()
+                        
+                        if status.find('Pn:') != -1:
+                            self.alarmed = 1
+                        #print(status)
+
+                    self.update_position.emit(self.x_pos, self.y_pos, self.z_pos)
+
+            # Yuan 8/11/2024: Use sleep_until logic to make sure step size is consistent
+            time_now = time.time()
+            time_elapsed = (time_now - last_time)
+            time.sleep(max(0, time_step - time_elapsed))
+            last_time = time.time()
+            print((last_time-time_started)*1000)
+
+    def stop(self):
+        self.running = False
+
+    # Yuan: 8/11 read until nothing can be read
     def read_hid_data(self):
-        try:
-            data = self.device.read(0x81, 8)
-            return data
-        except usb.core.USBError as e:
-            if e.args == ('Operation timed out',):
-                return None
-            raise
+        data = None
+        while True:
+            try:
+                data = self.device.read(0x81, 10, 1) # Added a timeout of 1ms. If no data is available within 1ms, then the queue is empty, quit
+            except usb.core.USBError as e:
+                if data == None:
+                    continue
+                else:
+                    break
+        #print(data)
+        return data
+
+    def parse_axis_data(self, low_byte, high_byte):
+        return (high_byte << 8) | low_byte
+
+    def map_value(self, value, min_input, max_input, range):
+        return 8 * range * ((value - (min_input + max_input) / 2) ** 3) / ((max_input - min_input) ** 3)
+
+    def map_value_z(self, value, min_input, max_input, range):
+        return 16 * range * ((value - (min_input + max_input) / 2) ** 4) / ((max_input - min_input) ** 4) * ((value - (min_input + max_input) / 2) / abs(value - (min_input + max_input) / 2))
+
+    def process_data(self, x, y, z):
+        x_speed = -self.map_value(x, 0x0000, 0x03FF, 4000)
+        y_speed = self.map_value(y, 0x0000, 0x03FF, 4000)
+        z_speed = self.map_value_z(z, 0x0000, 0x03FF, 31000)
+
+        tot_speed = (x_speed ** 2 + y_speed ** 2 + z_speed ** 2) ** 0.5
+
+        # Yuan: 8/11/2024: use consistent step size
+        dt = 0.055 / 60
+        dtz = 0.055 / 60
+
+        x_disp = x_speed * dt
+        y_disp = y_speed * dt
+        z_disp = z_speed * dtz
+
+        self.x_pos += x_disp
+        self.y_pos += y_disp
+        self.z_pos += z_disp
+
+        gcode_command = f'$J=G21G91X{x_disp:.3f}Y{y_disp:.3f}Z{z_disp:.3f}F{tot_speed:.1f}\n'
+        return gcode_command
+
+    def send_gcode_command(self, command, need_ret=True):
+        if need_ret:
+            ser.read_all() # Make sure there is nothing to read
+
+        ser.write(command.encode())
+        
+        if need_ret:
+            ret = ser.readline()
+            print('command=',command, 'ret=', ret)
+            return ret
+
+    def send_jog_cancel(self):
+        ser.write(b'\x85')
+        ser.flush()
+
+    def send_keep_on(self):
+        self.send_gcode_command('$1=255\n')
+        self.send_gcode_command('G0G91X0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
+        self.send_gcode_command('G0G91X-0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
+        # self.set_keyboard_led(True, False, False)
+
+    def send_keep_off(self):
+        self.send_gcode_command('$1=100\n')
+        self.send_gcode_command('G0G91X0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
+        self.send_gcode_command('G0G91X-0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
+        # self.set_keyboard_led(False, False, False)
+
+    def send_homing_command(self):
+        retries = 1
+        for _ in range(retries):
+            try:
+                ser.write(f'$H\n'.encode())
+                ser.flush()
+                time.sleep(3)  # 等待归零完成
+                self.update_position_from_device()
+                self.update_position_from_device()
+                break
+            except serial.SerialTimeoutException:
+                continue
+
+    def send_reset_alarm(self):
+        self.send_gcode_command('$X\n')
+        print('Reset alarm')
+
+    def send_status_request(self):
+        return self.send_gcode_command('?\n').decode().strip()
+
+    def check_keyboard(self, data):
+        if data[6] == 0x01:
+            return 1
+        elif data[6] == 0x02:
+            return 2
+        elif data[6] == 0x04:
+            return 3
+        elif data[6] == 0x08:
+            return 4
+        elif data[6] == 0x10:
+            return 5
+        elif data[6] == 0x20:
+            return 6
+        elif data[6] == 0x40:
+            return 7
+        elif data[6] == 0x80:
+            return 8
+
+    def x_map(self, x):
+        if x < 512:
+            return 512 - 512 * (512 - x) / (512 - self.x_min)
+        if x > 512:
+            return 512 + 512 * (512 - x) / (512 - self.x_max)
+        return 512
+
+    def y_map(self, y):
+        if y < 512:
+            return 512 - 512 * (512 - y) / (512 - self.y_min)
+        if y > 512:
+            return 512 + 512 * (512 - y) / (512 - self.y_max)
+        return 512
+    
+    def z_map(self, z):
+        if z < 512:
+            return 512 - 512 * (512 - z) / (512 - self.z_min)
+        if z > 512:
+            return 512 + 512 * (512 - z) / (512 - self.z_max)
+        return 512
+
+    def update_position_from_device(self):
+        response = self.send_status_request()
+        if response.startswith('<'):
+            positions = self.parse_position_response(response)
+            self.update_position.emit(*positions)
+
+    def parse_position_response(self, response):
+        # 假设响应格式为 '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000>'
+        mpos_start = response.find('MPos:') + len('MPos:')
+        mpos_end = response.find('|', mpos_start)
+        mpos_str = response[mpos_start:mpos_end]
+        mpos = list(map(float, mpos_str.split(',')))
+        self.x_pos, self.y_pos, self.z_pos = mpos
+        return self.x_pos, self.y_pos, self.z_pos
 
 
 class MainWidget(QWidget):
@@ -215,6 +391,8 @@ class MainWidget(QWidget):
         self.btn_homing.clicked.connect(self.onHoming)
         self.btn_kill_alarm = QPushButton("Kill Alarm")
         self.btn_kill_alarm.clicked.connect(self.onKillAlarm)
+        self.btn_unlock_motor = QPushButton("Unlock Motor")
+        self.btn_unlock_motor.clicked.connect(self.onUnlockMotor)
 
         vlytctrl = QVBoxLayout()
         vlytctrl.addWidget(gboxres)
@@ -225,6 +403,7 @@ class MainWidget(QWidget):
         vlytctrl.addWidget(self.btn_focus)
         vlytctrl.addWidget(self.btn_homing)
         vlytctrl.addWidget(self.btn_kill_alarm)
+        vlytctrl.addWidget(self.btn_unlock_motor)
         vlytctrl.addStretch()
         wgctrl = QWidget()
         wgctrl.setLayout(vlytctrl)
@@ -290,14 +469,14 @@ class MainWidget(QWidget):
         event.accept()
 
     def onResolutionChanged(self, index):
-        if self.hcam: #step 1: stop camera
+        if self.hcam:  # step 1: stop camera
             self.hcam.Stop()
 
         self.res = index
         self.imgWidth = self.cur.model.res[index].width
         self.imgHeight = self.cur.model.res[index].height
 
-        if self.hcam: #step 2: restart camera
+        if self.hcam:  # step 2: restart camera
             self.hcam.put_eSize(self.res)
             self.startCamera()
 
@@ -380,7 +559,7 @@ class MainWidget(QWidget):
                     self.cmb_res.addItem("{}*{}".format(self.cur.model.res[i].width, self.cur.model.res[i].height))
                 self.cmb_res.setCurrentIndex(self.res)
                 self.cmb_res.setEnabled(True)
-            self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0) #Qimage use RGB byte order
+            self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0)  # Qimage use RGB byte order
             self.hcam.put_AutoExpoEnable(1)
             self.startCamera()
             # Start position worker
@@ -412,7 +591,7 @@ class MainWidget(QWidget):
 
     def onBtnSnap(self):
         if self.hcam:
-            if 0 == self.cur.model.still:    # not support still image capture
+            if 0 == self.cur.model.still:  # not support still image capture
                 if self.pData is not None:
                     image = QImage(self.pData, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
                     self.count += 1
@@ -425,13 +604,18 @@ class MainWidget(QWidget):
                     menu.addAction(action)
                 action = menu.exec(self.mapToGlobal(self.btn_snap.pos()))
                 self.hcam.Snap(action.data())
-    
+
     def onBtnFocus(self):
         if self.hcam:
             # 如果当前有运行中的线程，先停止它
             if self.focus_thread is not None and self.focus_thread.isRunning():
                 self.focus_thread.stop()
                 self.focus_thread.wait()
+
+            # 停止 HID 设备控制
+            if self.position_worker is not None and self.position_worker.isRunning():
+                self.position_worker.running = False
+                self.position_worker.wait()
 
             # 创建并启动新的Focus线程
             self.focus_thread = FocusThread(self)
@@ -440,7 +624,10 @@ class MainWidget(QWidget):
 
     def onFocusFinished(self):
         print("Focus operation completed.")
-        self.focus_thread = None  # Reset the thread variable  
+        self.focus_thread = None  # Reset the thread variable
+
+        # 重新启动 HID 设备控制
+        self.start_position_worker()
 
     def onHoming(self):
         self.send_gcommand('G28\n', need_ret=False)
@@ -449,6 +636,10 @@ class MainWidget(QWidget):
     def onKillAlarm(self):
         self.send_gcommand('$X\n', need_ret=False)
         print("Kill Alarm initiated")
+
+    def onUnlockMotor(self):
+        self.send_gcommand('$M84\n', need_ret=False)
+        print("Motor unlocked")
 
     def climb_hill_focus(self, first_step, min_step, max_iteration):
         auto_focus = AutoFocus()
@@ -500,7 +691,7 @@ class MainWidget(QWidget):
                             self.send_gcommand(f'$J=G91Z{-z_displacement}F30000\n')
                             print("Focus operation completed")
                             return
-                    elif l_var[2]<l_var[1]:
+                    elif l_var[2] < l_var[1]:
                         direction = - direction
                         continue
                     else:
@@ -528,7 +719,7 @@ class MainWidget(QWidget):
 
             rough_iteration_count += 1
             print(f"Rough Iteration: {rough_iteration_count}, Delta U: {delta_u}")
-        
+
         print(f"Rough Approach Finished, current Max DFD: {u_real_max_min:.6f} m")
 
     def fine_approach(self, step_size, max_iteration):
@@ -558,7 +749,7 @@ class MainWidget(QWidget):
             if FV_queue[0] > FV_queue[1] and FV_queue[1] < FV_queue[2] and FV_queue[1] != 0 and FV_queue[0] != 0:
                 flag = 1
                 break
-        
+
         if flag == 1:
             print(f"Fine Approach Finished")
         else:
@@ -627,7 +818,7 @@ class MainWidget(QWidget):
     def handleStillImageEvent(self):
         info = toupcam.ToupcamFrameInfoV3()
         try:
-            self.hcam.PullImageV3(None, 1, 24, 0, info) # peek
+            self.hcam.PullImageV3(None, 1, 24, 0, info)  # peek
         except toupcam.HRESULTException:
             pass
         else:
@@ -647,19 +838,17 @@ class MainWidget(QWidget):
             ser.read_all()  # Make sure there is nothing to read
 
         ser.write(command.encode())
-        
+
         if need_ret:
             ret = ser.readline()
             print('command=', command, 'ret=', ret)
             return ret
 
     def start_position_worker(self):
-        # 如果当前有运行中的位置线程，先停止它
         if self.position_worker is not None and self.position_worker.isRunning():
             self.position_worker.running = False
             self.position_worker.wait()
 
-        # 创建并启动新的PositionWorker线程
         self.position_worker = PositionWorker()
         self.position_worker.update_position.connect(self.update_position)
         self.position_worker.start()
