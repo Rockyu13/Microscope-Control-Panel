@@ -55,14 +55,17 @@ class PositionWorker(QThread):
         self.x_pos = 0.0
         self.y_pos = 0.0
         self.z_pos = 0.0
-        self.flag = 1
+        self.flag = 0  # 用于控制键盘输入的状态
+        self.home = 0
+        self.alarmed = 0  # True if the system becomes in alarm status. Need to press button to reset
         self.cancel = 0
         self.move = 0
-        self.home = 0
-        self.alarmed = 0
-        self.x_min, self.x_max = 0, 1023
-        self.y_min, self.y_max = 0, 1023
-        self.z_min, self.z_max = 0, 1023
+        self.x_min = 2
+        self.x_max = 982
+        self.y_min = 46
+        self.y_max = 1023
+        self.z_min = 63
+        self.z_max = 1023
 
     def run(self):
         self.running = True
@@ -212,28 +215,23 @@ class PositionWorker(QThread):
 
     def send_keep_on(self):
         self.send_gcode_command('$1=255\n')
-        self.send_gcode_command('G0G91X0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
-        self.send_gcode_command('G0G91X-0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
-        # self.set_keyboard_led(True, False, False)
+        self.send_gcode_command('G0G91X0.01\n') 
+        self.send_gcode_command('G0G91X-0.01\n') 
 
     def send_keep_off(self):
         self.send_gcode_command('$1=100\n')
-        self.send_gcode_command('G0G91X0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
-        self.send_gcode_command('G0G91X-0.01\n') # Yuan 8/11/2024: Dummy move to turn on motor
-        # self.set_keyboard_led(False, False, False)
+        self.send_gcode_command('G0G91X0.01\n') 
+        self.send_gcode_command('G0G91X-0.01\n') 
 
     def send_homing_command(self):
-        retries = 1
-        for _ in range(retries):
-            try:
-                ser.write(f'$H\n'.encode())
-                ser.flush()
-                time.sleep(3)  # 等待归零完成
-                self.update_position_from_device()
-                self.update_position_from_device()
-                break
-            except serial.SerialTimeoutException:
-                continue
+        try:
+            ser.write(f'$H\n'.encode())
+            ser.flush()
+            time.sleep(3) 
+            self.update_position_from_device()
+            self.update_position_from_device()        
+        except serial.SerialTimeoutException:
+            print("Homing command timeout")
 
     def send_reset_alarm(self):
         self.send_gcode_command('$X\n')
@@ -626,20 +624,19 @@ class MainWidget(QWidget):
         print("Focus operation completed.")
         self.focus_thread = None  # Reset the thread variable
 
-        # 重新启动 HID 设备控制
         self.start_position_worker()
 
     def onHoming(self):
-        self.send_gcommand('G28\n', need_ret=False)
-        print("Homing initiated")
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_homing_command()
 
     def onKillAlarm(self):
-        self.send_gcommand('$X\n', need_ret=False)
-        print("Kill Alarm initiated")
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_reset_alarm()
 
     def onUnlockMotor(self):
-        self.send_gcommand('$M84\n', need_ret=False)
-        print("Motor unlocked")
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_keep_on()
 
     def climb_hill_focus(self, first_step, min_step, max_iteration):
         auto_focus = AutoFocus()
@@ -647,8 +644,6 @@ class MainWidget(QWidget):
         l_var = np.zeros((3,), dtype=np.float64)
         count = 0
         direction = 1
-        best_var = 0
-        distance_from_best = 0
 
         image = self.last_image.copy()
         gray_image = auto_focus.rgb_to_gray(image)
@@ -679,9 +674,9 @@ class MainWidget(QWidget):
                 else:
                     if l_var[1] >= l_var[0] and l_var[1] >= l_var[2]:
                         if abs(z_displacement) > min_step:
-                            self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
-                            time.sleep(0.3)
-                            l_var[1], l_var[2] = l_var[2], l_var[1]
+                            # self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
+                            # time.sleep(0.3)
+                            # l_var[1], l_var[2] = l_var[2], l_var[1]
                             direction = - direction
                             z_displacement = z_displacement / 2
                             print("go back with halved step")
@@ -696,64 +691,6 @@ class MainWidget(QWidget):
                         continue
                     else:
                         continue
-
-    def rough_approach(self, first_step, threshold, n):
-        auto_focus = AutoFocus()
-        delta_u = first_step
-        u_real_max_min = float('inf')
-        rough_iteration_count = 0
-
-        while u_real_max_min >= threshold:
-            image1 = self.last_image.copy()
-            gray_image1 = auto_focus.rgb_to_gray(image1)
-
-            self.send_gcommand(f'$J=G91Z{delta_u}F30000\n')
-            print(f"Moving Z axis {delta_u} um")
-            time.sleep(0.5)
-
-            image2 = self.last_image.copy()
-            gray_image2 = auto_focus.rgb_to_gray(image2)
-
-            u_real_max_min = auto_focus.max_dfd(gray_image1, gray_image2, delta_u)
-            delta_u = u_real_max_min / n
-
-            rough_iteration_count += 1
-            print(f"Rough Iteration: {rough_iteration_count}, Delta U: {delta_u}")
-
-        print(f"Rough Approach Finished, current Max DFD: {u_real_max_min:.6f} m")
-
-    def fine_approach(self, step_size, max_iteration):
-        auto_focus = AutoFocus()
-        FV_queue = np.zeros((3,), dtype=np.float32)
-        direction = 1
-        flag = 0
-
-        image = self.last_image.copy()
-        gray_image = auto_focus.rgb_to_gray(image)
-        FV = auto_focus.calculate_FV(gray_image)
-        FV_queue[-1] = FV
-
-        for i in range(max_iteration):
-            if not self.focus_thread.is_running:
-                break  # If the thread is stopped, break out of the loop
-
-            self.send_gcommand(f"$J=G91Z{step_size * direction}F31000\n")
-            time.sleep(0.5)
-            image = self.last_image.copy()
-            gray_image = auto_focus.rgb_to_gray(image)
-            FV = auto_focus.calculate_FV(gray_image)
-            if FV > FV_queue[-1] and FV_queue[-1] != 0:
-                direction = -direction
-            FV_queue[:-1] = FV_queue[1:]
-            FV_queue[-1] = FV
-            if FV_queue[0] > FV_queue[1] and FV_queue[1] < FV_queue[2] and FV_queue[1] != 0 and FV_queue[0] != 0:
-                flag = 1
-                break
-
-        if flag == 1:
-            print(f"Fine Approach Finished")
-        else:
-            print(f"Fine Approach Failed, please change the parameters")
 
     @staticmethod
     def eventCallBack(nEvent, self):
