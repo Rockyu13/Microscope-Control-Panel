@@ -35,7 +35,7 @@ class FocusThread(QThread):
         self.is_running = True
 
     def run(self):
-        self.main_widget.climb_hill_focus(100, 10, 20)
+        self.main_widget.climb_hill_focus(50, 5, 20)
         self.finished.emit()
 
     def stop(self):
