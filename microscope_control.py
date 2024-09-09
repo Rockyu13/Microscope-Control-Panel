@@ -111,21 +111,19 @@ class PositionWorker(QThread):
                 y = self.y_map(y)
                 z = self.z_map(z)
 
-                # Yuan edit 8/11/2024: Check of cancel flag is moved inside. Otherwise the program keeps sending zero jogs even when joystick not moving
-                # If in alarmed status, no more moving
+                # Jog cancellation logic
                 if (abs(x - 0x0200) < 0x0020 and abs(y - 0x0200) < 0x0020 and abs(z - 0x0200) < 0x0010) or self.alarmed:
                     if self.cancel == 0:
                         ser.reset_input_buffer()
                         self.send_jog_cancel()
-                        self.update_position_from_device() # Yuan 8/11/2024: update once jog has stopped
+                        self.update_position_from_device() # update once jog has stopped
                         self.cancel = 1
-                        time.sleep(0.1) # Yuan 8/11/2024: simply add a wait. This could be done better by checking "Idle" status
-                    #print('no move')
-                else:  # Yuan 8/11/2024 changed to if/else so that there will be 20ms delay even if no move
+                        time.sleep(0.1)
+                else: 
                     print('move')
                     gcode_command = self.process_data(x, y, z)
+                    # Once move, keep the motor on
                     if gcode_command:
-                        # 8/11/2024 Yuan: make sure it stays ON once a move has been issued
                         if self.flag != 1:
                             self.send_keep_on()
                             self.flag = 1
@@ -143,22 +141,19 @@ class PositionWorker(QThread):
 
                     self.update_position.emit(self.x_pos, self.y_pos, self.z_pos)
 
-            # Yuan 8/11/2024: Use sleep_until logic to make sure step size is consistent
             time_now = time.time()
             time_elapsed = (time_now - last_time)
             time.sleep(max(0, time_step - time_elapsed))
             last_time = time.time()
-            print((last_time-time_started)*1000)
 
     def stop(self):
         self.running = False
 
-    # Yuan: 8/11 read until nothing can be read
     def read_hid_data(self):
         data = None
         while True:
             try:
-                data = self.device.read(0x81, 10, 1) # Added a timeout of 1ms. If no data is available within 1ms, then the queue is empty, quit
+                data = self.device.read(0x81, 10, 1)
             except usb.core.USBError as e:
                 if data == None:
                     continue
@@ -183,9 +178,9 @@ class PositionWorker(QThread):
 
         tot_speed = (x_speed ** 2 + y_speed ** 2 + z_speed ** 2) ** 0.5
 
-        # Yuan: 8/11/2024: use consistent step size
-        dt = 0.055 / 60
-        dtz = 0.055 / 60
+        #Step size setting
+        dt = 0.025 / 60
+        dtz = 0.025 / 60
 
         x_disp = x_speed * dt
         y_disp = y_speed * dt
@@ -200,7 +195,7 @@ class PositionWorker(QThread):
 
     def send_gcode_command(self, command, need_ret=True):
         if need_ret:
-            ser.read_all() # Make sure there is nothing to read
+            ser.read_all()
 
         ser.write(command.encode())
         
@@ -229,7 +224,7 @@ class PositionWorker(QThread):
             ser.flush()
             time.sleep(3) 
             self.update_position_from_device()
-            self.update_position_from_device()        
+            time.sleep(0.5)
         except serial.SerialTimeoutException:
             print("Homing command timeout")
 
@@ -286,7 +281,7 @@ class PositionWorker(QThread):
             self.update_position.emit(*positions)
 
     def parse_position_response(self, response):
-        # 假设响应格式为 '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000>'
+        # The response should be in terms of '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000>'
         mpos_start = response.find('MPos:') + len('MPos:')
         mpos_end = response.find('|', mpos_start)
         mpos_str = response[mpos_start:mpos_end]
@@ -649,7 +644,6 @@ class MainWidget(QWidget):
         gray_image = auto_focus.rgb_to_gray(image)
         l_var[-1] = auto_focus.laplacian_variance(gray_image)
         print(f"Initial Laplacian Variance: {l_var[-1]:.6f}")
-        best_var = l_var[-1]
 
         if self.hcam:
             for i in range(max_iteration):
