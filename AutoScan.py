@@ -109,7 +109,8 @@ class FocusThread(QThread):
         self.is_running = True
 
     def run(self):
-        self.main_widget.climb_hill_focus(50, 5, 20)
+        #self.main_widget.climb_hill_focus(100, 10, 20)
+        self.main_widget.smooth_approach(100, 20, 15)
         self.finished.emit()
 
     def stop(self):
@@ -707,7 +708,7 @@ class MainWidget(QWidget):
         l_var = np.zeros((3,), dtype=np.float64)
         count = 0
         direction = 1
-        positive_multiplier = 0.4
+        positive_multiplier = 0.5
 
         gray_image = auto_focus.rgb_to_gray(self.last_image)
         l_var[-1] = auto_focus.laplacian_variance(gray_image)
@@ -787,7 +788,7 @@ class MainWidget(QWidget):
                 if direction == 1:
                     self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
                 else:
-                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement * 2}F30000\n')
                 
                 time.sleep(0.3)
                 
