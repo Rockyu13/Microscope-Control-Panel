@@ -25,7 +25,6 @@ class AutoFocus:
         laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
         return laplacian.var()
 
-
 class FocusThread(QThread):
     finished = pyqtSignal()
 
@@ -35,7 +34,7 @@ class FocusThread(QThread):
         self.is_running = True
 
     def run(self):
-        self.main_widget.climb_hill_focus(50, 5, 20)
+        self.main_widget.climb_hill_focus(50.0, 10.0, 20)
         self.finished.emit()
 
     def stop(self):
@@ -650,8 +649,14 @@ class MainWidget(QWidget):
                 if not self.focus_thread.is_running:
                     break
 
-                self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                if direction == 1:
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement* 0.4}F30000\n')
+                else:
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                
                 time.sleep(0.3)
+
+                start_time = time.time()
                 image = self.last_image.copy()
                 gray_image = auto_focus.rgb_to_gray(image)
                 laplacian_variance = auto_focus.laplacian_variance(gray_image)
@@ -659,6 +664,9 @@ class MainWidget(QWidget):
                 l_var[-1] = laplacian_variance
                 print(f"Iteration: {i}, Laplacian Variance: {laplacian_variance:.6f}")
                 count += 1
+                end_time = time.time()
+                print(f"Time to calculate:{end_time-start_time:.6f}s")
+
                 if count == 1:
                     if l_var[2] >= l_var[1]:
                         print("first step direction correct")
@@ -677,11 +685,14 @@ class MainWidget(QWidget):
                             continue
                         if abs(z_displacement) <= min_step:
                             print(f"z_displacement = {z_displacement} um")
-                            self.send_gcommand(f'$J=G91Z{-z_displacement}F30000\n')
+                            if direction == 1:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement* 0.4}F30000\n')
+                            else:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
                             print("Focus operation completed")
                             return
-                    elif l_var[2] < l_var[1]:
-                        direction = - direction
+                    # elif l_var[2] < l_var[1]:
+                    #     direction = - direction
                         continue
                     else:
                         continue
