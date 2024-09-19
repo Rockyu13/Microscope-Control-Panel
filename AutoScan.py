@@ -16,12 +16,14 @@ ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
 
 class ScanThread(QThread):
-    def __init__(self, main_widget):
+    def __init__(self, main_widget, start_point, end_point):
         super().__init__()
         self.main_widget = main_widget
+        self.start_point = start_point
+        self.end_point = end_point
 
     def run(self):
-        self.main_widget.scan_capture()
+        self.main_widget.scan_capture(self.start_point, self.end_point)
 
 class SavePathDialog(QWidget):
     def __init__(self, main_widget):
@@ -611,7 +613,6 @@ class MainWidget(QWidget):
             self.slider_temp.setEnabled(self.cur.model.flag & toupcam.TOUPCAM_FLAG_MONO == 0)
             self.slider_tint.setEnabled(self.cur.model.flag & toupcam.TOUPCAM_FLAG_MONO == 0)
             self.btn_open.setText("Close")
-            self.btn_snap.setEnabled(True)
             self.btn_focus.setEnabled(True)
             bAuto = self.hcam.get_AutoExpoEnable()
             self.cbox_auto.setChecked(1 == bAuto)
@@ -818,8 +819,8 @@ class MainWidget(QWidget):
                             break
 
     def scan_capture(self,start_point, end_point):
-        start_x, start_y = start_point[0], start_point[1]
-        end_x, end_y = end_point[0], end_point[1]
+        start_x, start_y = start_point
+        end_x, end_y = end_point
         self.scan = 0
 
         step_size_x = 40
@@ -862,7 +863,7 @@ class MainWidget(QWidget):
         self.picture_save_folder = folder_path
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.terminate()
-        self.scan_thread = ScanThread(self)
+        self.scan_thread = ScanThread(self, self.start_point, self.end_point)
         self.scan_thread.start()
 
     @staticmethod
@@ -905,7 +906,13 @@ class MainWidget(QWidget):
     def display_image(self, image):
         qimage = QImage(image, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage)
-        self.lbl_video.setPixmap(pixmap)
+
+        label_width = self.lbl_video.width()
+        label_height = self.lbl_video.height()
+
+        scaled_pixmap = pixmap.scaled(label_width, label_height, Qt.KeepAspectRatio)
+
+        self.lbl_video.setPixmap(scaled_pixmap)
 
     def handleExpoEvent(self):
         time = self.hcam.get_ExpoTime()
