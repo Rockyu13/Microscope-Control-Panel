@@ -14,6 +14,15 @@ import os
 
 ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
+
+class ScanThread(QThread):
+    def __init__(self, main_widget):
+        super().__init__()
+        self.main_widget = main_widget
+
+    def run(self):
+        self.main_widget.scan_capture()
+
 class SavePathDialog(QWidget):
     def __init__(self, main_widget):
         super().__init__()
@@ -391,7 +400,8 @@ class MainWidget(QWidget):
         self.scan_count = None
 
         self.focus_thread = None  # Initialize focus_thread attribute
-        self.position_worker = None
+        self.position_worker = None # Initialize position_worker attribute
+        self.scan_thread = None # Initialize scan_thread attribute
 
         self.start_point = None
         self.end_point = None
@@ -816,6 +826,7 @@ class MainWidget(QWidget):
         step_size_y = 30
 
         self.save_count = 0
+        print('Start Scanning...')
 
         self.nx = math.ceil((end_x - start_x) / step_size_x)
         self.ny = math.ceil((end_y - start_y) / step_size_y)
@@ -849,7 +860,10 @@ class MainWidget(QWidget):
     def start_scan(self, folder_path):
         print(f"Start scanning, files saved to: {folder_path}")
         self.picture_save_folder = folder_path
-        self.scan_capture(self.start_point, self.end_point)
+        if self.scan_thread and self.scan_thread.isRunning():
+            self.scan_thread.terminate()
+        self.scan_thread = ScanThread(self)
+        self.scan_thread.start()
 
     @staticmethod
     def eventCallBack(nEvent, self):
@@ -916,6 +930,8 @@ class MainWidget(QWidget):
         if self.scan:
             info = toupcam.ToupcamFrameInfoV3()
             self.save_count += 1
+            print('{self.save_count} pictures saved')
+            
             try:
                 if info.width > 0 and info.height > 0:
                     buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
