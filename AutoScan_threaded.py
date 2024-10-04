@@ -14,7 +14,6 @@ import os
 
 ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
-
 class ScanThread(QThread):
     def __init__(self, main_widget, start_point, end_point):
         super().__init__()
@@ -849,12 +848,30 @@ class MainWidget(QWidget):
             for j in range(self.ny + 1):
                 self.send_gcommand(f'G0G90X{X[i]}Y{Y[j]}\n')
                 time.sleep(0.5)
+                # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.climb_hill_focus(100.0, 10.0, 20)
+                    self.start_focus_thread('climb_hill_focus', 100.0, 10.0, 20)
                 else:
-                    self.smooth_approach(20.0, 2.0, 15)
+                    self.start_focus_thread('smooth_approach', 20.0, 2.0, 15)
+                
+                self.focus_thread.wait()
                 toupcam.Toupcam.Snap(0)
 
+    def start_focus_thread(self, method, *args):
+        # 创建一个新的聚焦线程，并运行指定的聚焦方法
+        if self.focus_thread and self.focus_thread.isRunning():
+            self.focus_thread.stop()
+            self.focus_thread.wait()
+    
+        # 根据方法名选择执行的聚焦方法
+        if method == 'climb_hill_focus':
+            self.focus_thread = FocusThread(self, self.climb_hill_focus, *args)
+        elif method == 'smooth_approach':
+            self.focus_thread = FocusThread(self, self.smooth_approach, *args)
+        
+        self.focus_thread.finished.connect(self.onFocusFinished)
+        self.focus_thread.start()
+    
     def show_save_path_dialog(self):
         self.dialog = SavePathDialog(self)
         self.dialog.show()
