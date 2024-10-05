@@ -14,7 +14,6 @@ import os
 
 ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
-
 class ScanThread(QThread):
     def __init__(self, main_widget, start_point, end_point):
         super().__init__()
@@ -103,18 +102,16 @@ class AutoFocus:
 class FocusThread(QThread):
     finished = pyqtSignal()
 
-    def __init__(self, main_widget):
+    def __init__(self, main_widget, focus_method, *args):
         super().__init__()
         self.main_widget = main_widget
-        self.is_running = True
+        self.focus_method = focus_method  # 传入聚焦方法
+        self.args = args  # 聚焦方法的参数
 
     def run(self):
-        #self.main_widget.climb_hill_focus(100, 10, 20)
-        self.main_widget.smooth_approach(100, 20, 15)
+        # 动态调用聚焦方法
+        self.focus_method(*self.args)
         self.finished.emit()
-
-    def stop(self):
-        self.is_running = False
 
 class PositionWorker(QThread):
     update_position = pyqtSignal(float, float, float)
@@ -664,8 +661,7 @@ class MainWidget(QWidget):
     def onBtnFocus(self):
         if self.hcam:
             # 如果当前有运行中的线程，先停止它
-            if self.focus_thread is not None and self.focus_thread.isRunning():
-                self.focus_thread.stop()
+            if self.focus_thread and self.focus_thread.isRunning():
                 self.focus_thread.wait()
 
             # 停止 HID 设备控制
@@ -674,7 +670,7 @@ class MainWidget(QWidget):
                 self.position_worker.wait()
 
             # 创建并启动新的Focus线程
-            self.focus_thread = FocusThread(self)
+            self.focus_thread = FocusThread(self, self.smooth_approach, 100.0, 10.0, 20)
             self.focus_thread.finished.connect(self.onFocusFinished)
             self.focus_thread.start()
 
@@ -716,7 +712,7 @@ class MainWidget(QWidget):
 
         if self.hcam:
             for i in range(max_iteration):
-                if not self.focus_thread.is_running:
+                if not self.focus_thread.isRunning():
                     break
 
                 if direction == 1:
@@ -848,13 +844,31 @@ class MainWidget(QWidget):
         for i in range(self.nx + 1):
             for j in range(self.ny + 1):
                 self.send_gcommand(f'G0G90X{X[i]}Y{Y[j]}\n')
-                time.sleep(0.5)
+                time.sleep(0.3)
+                # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.climb_hill_focus(100.0, 10.0, 20)
+                    self.start_focus_thread('climb_hill_focus', 100.0, 10.0, 20)
                 else:
-                    self.smooth_approach(20.0, 2.0, 15)
+                    self.start_focus_thread('smooth_approach', 100.0, 10.0, 20)
+                
+                self.focus_thread.wait()
                 toupcam.Toupcam.Snap(0)
 
+    def start_focus_thread(self, method, *args):
+        # 创建一个新的聚焦线程，并运行指定的聚焦方法
+        if self.focus_thread and self.focus_thread.isRunning():
+            self.focus_thread.stop()
+            self.focus_thread.wait()
+    
+        # 根据方法名选择执行的聚焦方法
+        if method == 'climb_hill_focus':
+            self.focus_thread = FocusThread(self, self.climb_hill_focus, *args)
+        elif method == 'smooth_approach':
+            self.focus_thread = FocusThread(self, self.smooth_approach, *args)
+        
+        self.focus_thread.finished.connect(self.onFocusFinished)
+        self.focus_thread.start()
+    
     def show_save_path_dialog(self):
         self.dialog = SavePathDialog(self)
         self.dialog.show()
