@@ -244,17 +244,17 @@ class PositionWorker(QThread):
         return 16 * range * ((value - (min_input + max_input) / 2) ** 4) / ((max_input - min_input) ** 4) * ((value - (min_input + max_input) / 2) / abs(value - (min_input + max_input) / 2))
 
     def process_data(self, x, y, z):
-        x_speed = -self.map_value(x, 0x0000, 0x03FF, 4000)
-        y_speed = self.map_value(y, 0x0000, 0x03FF, 4000)
-        z_speed = self.map_value_z(z, 0x0000, 0x03FF, 31000)
+        x_speed = -self.map_value(x, 0x0000, 0x03FF, 3000)
+        y_speed = self.map_value(y, 0x0000, 0x03FF, 3000)
+        z_speed = self.map_value_z(z, 0x0000, 0x03FF, 30000)
 
         tot_speed = (x_speed ** 2 + y_speed ** 2 + z_speed ** 2) ** 0.5
 
         #Step size setting
-        dt = 0.025 / 60
-        dtz = 0.025 / 60
+        dt = 0.05 / 60
+        dtz = 0.05 / 60
 
-        x_disp = x_speed * dt
+        x_disp = - x_speed * dt
         y_disp = y_speed * dt
         z_disp = z_speed * dtz
 
@@ -262,7 +262,7 @@ class PositionWorker(QThread):
         self.y_pos += y_disp
         self.z_pos += z_disp
 
-        gcode_command = f'$J=G21G91X{x_disp:.3f}Y{y_disp:.3f}Z{z_disp:.3f}F{tot_speed:.1f}\n'
+        gcode_command = f'$J=G21G91X{x_disp:.6f}Y{y_disp:.6f}Z{z_disp:.6f}F{tot_speed:.3f}\n'
         return gcode_command
 
     def send_gcode_command(self, command, need_ret=True):
