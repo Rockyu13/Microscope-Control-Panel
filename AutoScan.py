@@ -820,8 +820,8 @@ class MainWidget(QWidget):
         end_x, end_y = end_point
         self.scan = 0
 
-        step_size_x = 40
-        step_size_y = 30
+        step_size_x = 0.48
+        step_size_y = 0.32
 
         self.save_count = 0
         print('Start Scanning...')
@@ -852,7 +852,7 @@ class MainWidget(QWidget):
                     self.start_focus_thread('smooth_approach', 100.0, 10.0, 20)
                 
                 self.focus_thread.wait()
-                toupcam.Toupcam.Snap(0)
+                self.hcam.Snap(0)
 
     def start_focus_thread(self, method, *args):
         # 创建一个新的聚焦线程，并运行指定的聚焦方法
