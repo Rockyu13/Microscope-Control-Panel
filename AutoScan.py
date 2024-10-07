@@ -820,6 +820,12 @@ class MainWidget(QWidget):
         end_x, end_y = end_point
         self.scan = 0
 
+        if start_x > end_x:
+            start_x, end_x = end_x, start_x
+
+        if start_y > end_y:
+            start_y, end_y = end_y, start_y
+
         step_size_x = 0.48
         step_size_y = 0.32
 
@@ -952,7 +958,6 @@ class MainWidget(QWidget):
         if self.scan:
             info = toupcam.ToupcamFrameInfoV3()
             self.save_count += 1
-            print('{self.save_count} pictures saved')
             
             try:
                 if info.width > 0 and info.height > 0:
@@ -963,6 +968,7 @@ class MainWidget(QWidget):
                         pass
                     else:
                         image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3)
+                        print('{self.save_count} pictures saved')
                         j, i = divmod(self.save_count, self.nx)
                         j += 1
                         if i == 0:
