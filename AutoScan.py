@@ -670,7 +670,7 @@ class MainWidget(QWidget):
                 self.position_worker.wait()
 
             # 创建并启动新的Focus线程
-            self.focus_thread = FocusThread(self, self.smooth_approach, 100.0, 10.0, 20)
+            self.focus_thread = FocusThread(self, self.smooth_approach, 50.0, 20.0, 20)
             self.focus_thread.finished.connect(self.onFocusFinished)
             self.focus_thread.start()
 
@@ -778,13 +778,13 @@ class MainWidget(QWidget):
 
         if self.hcam:
             for i in range(max_iterations):
-                if not self.focus_thread.is_running:
+                if not self.focus_thread.isRunning:
                     break
 
                 if direction == 1:
                     self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
                 else:
-                    self.send_gcommand(f'$J=G91Z{direction * z_displacement * 2}F30000\n')
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
                 
                 time.sleep(0.3)
                 
@@ -813,9 +813,21 @@ class MainWidget(QWidget):
                             print('Slowly go back towards the peak')
                         else:
                             print('This is good enough though')
+                            direction = - direction
+                            for _ in range(2):    
+                                if direction == 1:
+                                    self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
+                                else:
+                                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                                time.sleep(0.3)
                             break
 
     def scan_capture(self,start_point, end_point):
+        start_x = 0
+        start_y = 0
+        end_x = 0
+        end_y = 0
+        
         start_x, start_y = start_point
         end_x, end_y = end_point
         self.scan = 0
@@ -843,19 +855,17 @@ class MainWidget(QWidget):
 
         X, Y = np.meshgrid(x_values, y_values, indexing='ij')
 
-        self.send_gcommand(f'G0G90X{start_x}Y{start_y}\n')
-
         self.scan = 1
 
         for i in range(self.nx + 1):
             for j in range(self.ny + 1):
-                self.send_gcommand(f'G0G90X{X[i]}Y{Y[j]}\n')
+                self.send_gcommand(f'G0G90X{X[i-1]:.3f}Y{Y[j-1]:.3f}\n')
                 time.sleep(0.3)
                 # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.start_focus_thread('climb_hill_focus', 100.0, 10.0, 20)
+                    self.start_focus_thread('smooth_approach', 20.0, 10.0, 20)
                 else:
-                    self.start_focus_thread('smooth_approach', 100.0, 10.0, 20)
+                    self.start_focus_thread('smooth_approach', 20.0, 5.0, 20)
                 
                 self.focus_thread.wait()
                 self.hcam.Snap(0)
