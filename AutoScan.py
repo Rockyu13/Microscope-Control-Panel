@@ -11,6 +11,7 @@ from PyQt5.QtCore import pyqtSignal, QTimer, Qt, QSignalBlocker, QThread
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QCheckBox, QMessageBox, QPushButton, QComboBox, QSlider, QGroupBox, QGridLayout, QHBoxLayout, QVBoxLayout, QMenu, QAction, QLCDNumber, QLineEdit, QFileDialog, QListView, QInputDialog, QListView
 import os
+from PIL import Image
 
 ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
@@ -977,16 +978,29 @@ class MainWidget(QWidget):
                     except toupcam.HRESULTException:
                         pass
                     else:
-                        image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3)
-                        print('{self.save_count} pictures saved')
+                        # 将图像数据转换为 NumPy 数组，并重塑为适当的形状
+                        image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgHeight, self.imgWidth, 3)
+                        
+                        # 将 NumPy 数组转换为 Pillow 图像对象
+                        image_pillow = Image.fromarray(image)
+
+                        print(f'{self.save_count} pictures saved')
+
+                        # 计算文件名并保存
                         j, i = divmod(self.save_count, self.nx)
                         j += 1
                         if i == 0:
                             i = self.nx
                         file_name = f'{i+1}_{j+1}.jpg'
                         file_path = os.path.join(self.picture_save_folder, file_name)
-                        cv2.imwrite(file_path, image)
-                        
+
+                        # 使用 Pillow 保存图像
+                        try:
+                            image_pillow.save(file_path)
+                            print(f"Image saved at {file_path}")
+                        except Exception as e:
+                            print(f"Failed to save image: {e}")
+                            
             except toupcam.HRESULTException:
                 pass
 
