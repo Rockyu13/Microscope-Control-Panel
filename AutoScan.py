@@ -860,16 +860,21 @@ class MainWidget(QWidget):
 
         for i in range(self.nx + 1):
             for j in range(self.ny + 1):
-                self.send_gcommand(f'G0G90X{X[i-1]:.3f}Y{Y[j-1]:.3f}\n')
+                self.send_gcommand(f'G0G90X{X[i]:.3f}Y{Y[j]:.3f}\n')
                 time.sleep(0.3)
                 # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.start_focus_thread('smooth_approach', 20.0, 10.0, 20)
+                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
                 else:
-                    self.start_focus_thread('smooth_approach', 20.0, 5.0, 20)
+                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
                 
                 self.focus_thread.wait()
-                self.hcam.Snap(0)
+                self.onResolutionChanged(self, 0)
+                image_pillow = Image.fromarray(self.last_image)
+                file_name = f'{i+1}_{j+1}.jpg'
+                file_path = os.path.join(self.picture_save_folder, file_name)
+                image_pillow.save(file_path, 'JPEG', quality = 85)
+                self.onResolutionChanged(self, 1)
 
     def start_focus_thread(self, method, *args):
         # 创建一个新的聚焦线程，并运行指定的聚焦方法
