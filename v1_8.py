@@ -128,9 +128,9 @@ class PositionWorker(QThread):
         self.x_pos = 0.0
         self.y_pos = 0.0
         self.z_pos = 0.0
-        self.flag = 0  # 用于控制键盘输入的状态
+        self.flag = 0
         self.home = 0
-        self.alarmed = 0  # True if the system becomes in alarm status. Need to press button to reset
+        self.alarmed = 0
         self.cancel = 0
         self.move = 0
         self.x_min = 2
@@ -359,9 +359,10 @@ class PositionWorker(QThread):
         mpos_end = response.find('|', mpos_start)
         mpos_str = response[mpos_start:mpos_end]
         mpos = list(map(float, mpos_str.split(',')))
+        while len(mpos) < 3:
+            mpos.append('0')  # 或者其他默认值
         self.x_pos, self.y_pos, self.z_pos = mpos
         return self.x_pos, self.y_pos, self.z_pos
-
 
 class MainWidget(QWidget):
     evtCallback = pyqtSignal(int)
@@ -401,6 +402,8 @@ class MainWidget(QWidget):
         self.scan_count = None
         self.l_var = 0
         self.lvar_refresh_count = 0
+        self.is_scanning = 0
+        self.is_snapping = 0
 
         self.focus_thread = None  # Initialize focus_thread attribute
         self.position_worker = None # Initialize position_worker attribute
@@ -408,6 +411,10 @@ class MainWidget(QWidget):
 
         self.start_point = None
         self.end_point = None
+
+        self.scan_step_x = [4.8, 2.4, 1.2]
+        self.scan_step_y = [3.2, 1.6, 0.8]
+
 
         gboxres = QGroupBox("Resolution")
         self.cmb_res = QComboBox()
@@ -457,6 +464,8 @@ class MainWidget(QWidget):
 
         self.btn_open = QPushButton("Open")
         self.btn_open.clicked.connect(self.onBtnOpen)
+        self.btn_snap = QPushButton("Snap")
+        self.btn_snap.clicked.connect(self.onBtnSnap)
         self.btn_focus = QPushButton("Focus")
         self.btn_focus.clicked.connect(self.onBtnFocus)
         self.btn_homing = QPushButton("Homing")
@@ -473,6 +482,7 @@ class MainWidget(QWidget):
         vlytctrl.addWidget(gboxexp)
         vlytctrl.addWidget(gboxwb)
         vlytctrl.addWidget(self.btn_open)
+        vlytctrl.addWidget(self.btn_snap)
         vlytctrl.addWidget(self.btn_focus)
         vlytctrl.addWidget(self.btn_homing)
         vlytctrl.addWidget(self.btn_scan)
@@ -666,6 +676,24 @@ class MainWidget(QWidget):
                     self.cur = arr[action.data()]
                     self.openCamera()
 
+    def onBtnSnap(self):
+        if self.hcam:
+            if 0 == self.cur.model.still:    # not support still image capture
+                if self.pData is not None:
+                    image = QImage(self.pData, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
+                    self.count += 1
+                    image.save("pyqt{}.jpg".format(self.count))
+            else:
+                menu = QMenu()
+                for i in range(0, self.cur.model.still):
+                    action = QAction("{}*{}".format(self.cur.model.res[i].width, self.cur.model.res[i].height), self)
+                    action.setData(i)
+                    menu.addAction(action)
+                action = menu.exec(self.mapToGlobal(self.btn_snap.pos()))
+                hresult = self.hcam.Snap(action.data())
+                print(f"Snap HRESULT: ", action.data(), hresult)
+                self.is_snapping = 1
+
     def onBtnFocus(self):
         if self.hcam:
             # 如果当前有运行中的线程，先停止它
@@ -794,7 +822,7 @@ class MainWidget(QWidget):
                 else:
                     self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
                 
-                time.sleep(0.15)
+                time.sleep(0.3)
                 
                 start_time = time.time()
                 gray_image = auto_focus.rgb_to_gray(self.last_image)
@@ -846,10 +874,10 @@ class MainWidget(QWidget):
         if start_y > end_y:
             start_y, end_y = end_y, start_y
 
-        step_size_x = 0.48
-        step_size_y = 0.32
+        step_size_x = self.scan_x
+        step_size_y = self.scan_y
 
-        self.save_count = 0
+        self.scan_count = 0
         print('Start Scanning...')
 
         self.nx = math.ceil((end_x - start_x) / step_size_x)
@@ -871,17 +899,15 @@ class MainWidget(QWidget):
                 time.sleep(0.3)
                 # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
+                    self.start_focus_thread('smooth_approach', 100.0, 30.0, 20)
                 else:
-                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
+                    self.start_focus_thread('smooth_approach', 50.0, 20.0, 20)
                 
                 self.focus_thread.wait()
                 time.sleep(0.3)
-                image_pillow = Image.fromarray(self.last_image, mode="RGB")
-                file_name = f'{i+1}_{j+1}.jpeg'
-                file_path = os.path.join(self.picture_save_folder, file_name)
-                image_pillow.save(file_path, 'JPEG', quality = 85)
-                time.sleep(0.3)
+                hresult = self.hcam.Snap(0)
+                print(f"Snap HRESULT: ",hresult)
+                self.scan_count += 1
 
     def start_focus_thread(self, method, *args):
         # 创建一个新的聚焦线程，并运行指定的聚焦方法
@@ -899,6 +925,21 @@ class MainWidget(QWidget):
         self.focus_thread.start()
     
     def show_save_path_dialog(self):
+        menu = QMenu()
+        action1 = QAction("5x", self)
+        action2 = QAction("10x", self)
+        action3 = QAction("20x", self)
+        action1.setData(1)
+        action2.setData(2)
+        action3.setData(3)
+        menu.addAction(action1)
+        menu.addAction(action2)
+        menu.addAction(action3)
+        action = menu.exec(self.mapToGlobal(self.btn_scan.pos()))
+        if action:
+            self.scan_x = self.scan_step_x[action.data() - 1]
+            self.scan_y = self.scan_step_y[action.data() - 1]
+        print(f"Scan step size: x {self.scan_x} mm, y {self.scan_y} mm")
         self.dialog = SavePathDialog(self)
         self.dialog.show()
     
@@ -945,7 +986,7 @@ class MainWidget(QWidget):
             self.display_image(image_copy)
             self.last_image = None
             self.last_image = image_copy
-            if self.lvar_refresh_count == 10:
+            if self.lvar_refresh_count == 30:
                 self.lvar_refresh_count = 0
                 gray_image = auto_focus.rgb_to_gray(self.last_image)
                 self.l_var = auto_focus.laplacian_variance(gray_image)
@@ -985,43 +1026,73 @@ class MainWidget(QWidget):
         self.lbl_tint.setText(str(nTint))
 
     def handleStillImageEvent(self):
-        if self.scan:
-            info = toupcam.ToupcamFrameInfoV3()
-            self.save_count += 1
-            
-            try:
-                if info.width > 0 and info.height > 0:
-                    buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
-                    try:
-                        self.hcam.PullImageV3(buf, 1, 24, 0, info)
-                    except toupcam.HRESULTException:
-                        pass
-                    else:
-                        # 将图像数据转换为 NumPy 数组，并重塑为适当的形状
-                        image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgHeight, self.imgWidth, 3)
-                        
-                        # 将 NumPy 数组转换为 Pillow 图像对象
-                        image_pillow = Image.fromarray(image)
-
-                        print(f'{self.save_count} pictures saved')
-
-                        # 计算文件名并保存
-                        j, i = divmod(self.save_count, self.nx)
+        info = toupcam.ToupcamFrameInfoV3()
+        try:
+            self.hcam.PullImageV3(None, 1, 24, 0, info) # peek
+        except toupcam.HRESULTException:
+            pass
+        else:
+            if info.width > 0 and info.height > 0:
+                buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
+                try:
+                    self.hcam.PullImageV3(buf, 1, 24, 0, info)
+                except toupcam.HRESULTException:
+                    pass
+                else:
+                    image = QImage(buf, info.width, info.height, QImage.Format_RGB888)
+                    if self.is_snapping:
+                        self.is_snapping = 0
+                        image.save("snap{}.jpg".format(self.count))
+                    if self.scan:
+                        j, i = divmod(self.scan_count, self.nx)
                         j += 1
                         if i == 0:
                             i = self.nx
-                        file_name = f'{i+1}_{j+1}.jpg'
+                        file_name = f'{i}_{j}.jpg'
                         file_path = os.path.join(self.picture_save_folder, file_name)
+                        image.save(file_path)
+                    # self.count += 1
+                    # image.save("pyqt{}.jpg".format(self.count))
 
-                        # 使用 Pillow 保存图像
-                        try:
-                            image_pillow.save(file_path)
-                            print(f"Image saved at {file_path}")
-                        except Exception as e:
-                            print(f"Failed to save image: {e}")
+
+    # def handleStillImageEvent(self):
+    #     if self.scan:
+    #         info = toupcam.ToupcamFrameInfoV3()
+    #         self.save_count += 1
+            
+    #         try:
+    #             if info.width > 0 and info.height > 0:
+    #                 buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
+    #                 try:
+    #                     self.hcam.PullImageV3(buf, 1, 24, 0, info)
+    #                 except toupcam.HRESULTException:
+    #                     pass
+    #                 else:
+    #                     # 将图像数据转换为 NumPy 数组，并重塑为适当的形状
+    #                     image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgHeight, self.imgWidth, 3)
+                        
+    #                     # 将 NumPy 数组转换为 Pillow 图像对象
+    #                     image_pillow = Image.fromarray(image)
+
+    #                     print(f'{self.save_count} pictures saved')
+
+    #                     # 计算文件名并保存
+    #                     j, i = divmod(self.save_count, self.nx)
+    #                     j += 1
+    #                     if i == 0:
+    #                         i = self.nx
+    #                     file_name = f'{i+1}_{j+1}.jpg'
+    #                     file_path = os.path.join(self.picture_save_folder, file_name)
+
+    #                     # 使用 Pillow 保存图像
+    #                     try:
+    #                         image_pillow.save(file_path)
+    #                         print(f"Image saved at {file_path}")
+    #                     except Exception as e:
+    #                         print(f"Failed to save image: {e}")
                             
-            except toupcam.HRESULTException:
-                pass
+    #         except toupcam.HRESULTException:
+    #             pass
 
     def send_gcommand(self, command, need_ret=True):
         if need_ret:
