@@ -8,7 +8,7 @@ import time
 import serial
 from PyQt5.QtCore import pyqtSignal, QTimer, Qt, QSignalBlocker, QThread
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QCheckBox, QMessageBox, QPushButton, QComboBox, QSlider, QGroupBox, QGridLayout, QHBoxLayout, QVBoxLayout, QMenu, QAction
+from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QCheckBox, QMessageBox, QPushButton, QComboBox, QSlider, QGroupBox, QGridLayout, QHBoxLayout, QVBoxLayout, QMenu, QAction, QLCDNumber
 
 ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
 
@@ -20,50 +20,13 @@ class AutoFocus:
         gray_image = np.dot(image[..., :3], [38, 75, 15]) >> 7
         return gray_image.astype(np.uint8)
 
-    def max_dfd(self, gray_image1, gray_image2, delta_u):
-        V1 = gray_image1.astype(np.float32)
-        V2 = gray_image2.astype(np.float32)
-        ratio = np.sqrt(V2 / (V1 + 1e-10)) 
-
-        u_real_max = delta_u * ratio / (1 - ratio)
-        u_real_max_min = np.min(u_real_max)
-
-        print(f"Min of Max DFD: {u_real_max_min:.6f} m")
-        return u_real_max_min
-
-    def calculate_FV(self, gray_image):
-        alpha = 0.5
-        _, otsu_threshold = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        T = alpha * otsu_threshold
-
-        kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]])
-        variance = cv2.filter2D(gray_image.astype(np.float32), -1, kernel)
-
-        max_gradient = self.calculate_max_gradient(gray_image)
-
-        mask = variance > T
-        weighted_gradients = max_gradient[mask] ** 2
-        FV = np.sum(weighted_gradients)
-
-        return FV
-
-    def calculate_max_gradient(self, gray_image):
-        W1 = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        W2 = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        W3 = np.array([[0, 1, 2], [-1, 0, 1], [-2, -1, 0]])
-        W4 = np.array([[-2, -1, 0], [-1, 0, 1], [0, 1, 2]])
-
-        G1 = np.abs(cv2.filter2D(gray_image, -1, W1))
-        G2 = np.abs(cv2.filter2D(gray_image, -1, W2))
-        G3 = np.abs(cv2.filter2D(gray_image, -1, W3))
-        G4 = np.abs(cv2.filter2D(gray_image, -1, W4))
-
-        max_gradient = np.maximum(np.maximum(G1, G2), np.maximum(G3, G4))
-        return max_gradient
+    def laplacian_variance(self, gray_image):
+        """Calculate the variance of the Laplacian, which indicates the sharpness of the image."""
+        laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+        return laplacian.var()
 
 class FocusThread(QThread):
     finished = pyqtSignal()
-    update_image_signal = pyqtSignal(np.ndarray)
 
     def __init__(self, main_widget):
         super().__init__()
@@ -71,13 +34,260 @@ class FocusThread(QThread):
         self.is_running = True
 
     def run(self):
-        self.main_widget.rough_approach(100, 50, 10)  # 添加 rough_approach 调用
-        self.main_widget.fine_approach(5, 20)
-        self.main_widget.fine_approach(1, 10)
+        self.main_widget.climb_hill_focus(50.0, 10.0, 20)
         self.finished.emit()
 
     def stop(self):
         self.is_running = False
+
+class PositionWorker(QThread):
+    update_position = pyqtSignal(float, float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.device = usb.core.find(idVendor=0x054C, idProduct=0x0061)
+        if self.device is None:
+            raise ValueError('Device not found')
+        usb.util.claim_interface(self.device, 0)
+        self.device.set_configuration()
+        self.x_pos = 0.0
+        self.y_pos = 0.0
+        self.z_pos = 0.0
+        self.flag = 0  # 用于控制键盘输入的状态
+        self.home = 0
+        self.alarmed = 0  # True if the system becomes in alarm status. Need to press button to reset
+        self.cancel = 0
+        self.move = 0
+        self.x_min = 2
+        self.x_max = 982
+        self.y_min = 46
+        self.y_max = 1023
+        self.z_min = 63
+        self.z_max = 1023
+
+    def run(self):
+        self.running = True
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        time.sleep(0.1)
+
+        # Set reporting mask to 1
+        self.send_gcode_command('$10=1\n')
+        
+        # 8/11/2024 Yuan: make sure it stays ON at initialization
+        self.send_keep_on()
+        self.flag = 1
+        time_step = 0.04 # Yuan 8/11
+        last_time = time.time()
+        time_started = last_time
+        while self.running:
+            data = self.read_hid_data()
+            if data:
+                keyboard_input = self.check_keyboard(data)
+                if keyboard_input == 1 and self.flag != 1:
+                    self.send_keep_on()
+                    self.flag = 1
+                    print('on1')
+                elif keyboard_input == 2 and self.flag != 2:
+                    self.send_keep_off()
+                    self.flag = 2
+                    print('off')
+                
+                if keyboard_input == 5 and self.home == 0:
+                    self.send_homing_command()
+                    self.home = 1
+
+                if keyboard_input == 7 and self.alarmed == 1:
+                    self.send_reset_alarm()
+                    self.alarmed = 0
+
+                x = self.parse_axis_data(data[0], data[1])
+                y = self.parse_axis_data(data[2], data[3])
+                z = self.parse_axis_data(data[4], data[5])
+
+                x = self.x_map(x)
+                y = self.y_map(y)
+                z = self.z_map(z)
+
+                # Jog cancellation logic
+                if (abs(x - 0x0200) < 0x0020 and abs(y - 0x0200) < 0x0020 and abs(z - 0x0200) < 0x0010) or self.alarmed:
+                    if self.cancel == 0:
+                        ser.reset_input_buffer()
+                        self.send_jog_cancel()
+                        self.update_position_from_device() # update once jog has stopped
+                        self.cancel = 1
+                        time.sleep(0.1)
+                else: 
+                    print('move')
+                    gcode_command = self.process_data(x, y, z)
+                    # Once move, keep the motor on
+                    if gcode_command:
+                        if self.flag != 1:
+                            self.send_keep_on()
+                            self.flag = 1
+
+                        self.send_gcode_command(gcode_command, False)
+                        self.cancel = 0
+                        self.move = 1
+                        self.home = 0
+
+                        status = self.send_status_request()
+                        
+                        if status.find('Pn:') != -1:
+                            self.alarmed = 1
+                        #print(status)
+
+                    self.update_position.emit(self.x_pos, self.y_pos, self.z_pos)
+
+            time_now = time.time()
+            time_elapsed = (time_now - last_time)
+            time.sleep(max(0, time_step - time_elapsed))
+            last_time = time.time()
+
+    def stop(self):
+        self.running = False
+
+    def read_hid_data(self):
+        data = None
+        while True:
+            try:
+                data = self.device.read(0x81, 10, 1)
+            except usb.core.USBError as e:
+                if data == None:
+                    continue
+                else:
+                    break
+        #print(data)
+        return data
+
+    def parse_axis_data(self, low_byte, high_byte):
+        return (high_byte << 8) | low_byte
+
+    def map_value(self, value, min_input, max_input, range):
+        return 8 * range * ((value - (min_input + max_input) / 2) ** 3) / ((max_input - min_input) ** 3)
+
+    def map_value_z(self, value, min_input, max_input, range):
+        return 16 * range * ((value - (min_input + max_input) / 2) ** 4) / ((max_input - min_input) ** 4) * ((value - (min_input + max_input) / 2) / abs(value - (min_input + max_input) / 2))
+
+    def process_data(self, x, y, z):
+        x_speed = -self.map_value(x, 0x0000, 0x03FF, 4000)
+        y_speed = self.map_value(y, 0x0000, 0x03FF, 4000)
+        z_speed = self.map_value_z(z, 0x0000, 0x03FF, 31000)
+
+        tot_speed = (x_speed ** 2 + y_speed ** 2 + z_speed ** 2) ** 0.5
+
+        #Step size setting
+        dt = 0.025 / 60
+        dtz = 0.025 / 60
+
+        x_disp = x_speed * dt
+        y_disp = y_speed * dt
+        z_disp = z_speed * dtz
+
+        self.x_pos += x_disp
+        self.y_pos += y_disp
+        self.z_pos += z_disp
+
+        gcode_command = f'$J=G21G91X{x_disp:.3f}Y{y_disp:.3f}Z{z_disp:.3f}F{tot_speed:.1f}\n'
+        return gcode_command
+
+    def send_gcode_command(self, command, need_ret=True):
+        if need_ret:
+            ser.read_all()
+
+        ser.write(command.encode())
+        
+        if need_ret:
+            ret = ser.readline()
+            print('command=',command, 'ret=', ret)
+            return ret
+
+    def send_jog_cancel(self):
+        ser.write(b'\x85')
+        ser.flush()
+
+    def send_keep_on(self):
+        self.send_gcode_command('$1=255\n')
+        self.send_gcode_command('G0G91X0.01\n') 
+        self.send_gcode_command('G0G91X-0.01\n') 
+
+    def send_keep_off(self):
+        self.send_gcode_command('$1=100\n')
+        self.send_gcode_command('G0G91X0.01\n') 
+        self.send_gcode_command('G0G91X-0.01\n') 
+
+    def send_homing_command(self):
+        try:
+            ser.write(f'$H\n'.encode())
+            ser.flush()
+            time.sleep(3) 
+            self.update_position_from_device()
+            time.sleep(0.5)
+        except serial.SerialTimeoutException:
+            print("Homing command timeout")
+
+    def send_reset_alarm(self):
+        self.send_gcode_command('$X\n')
+        print('Reset alarm')
+
+    def send_status_request(self):
+        return self.send_gcode_command('?\n').decode().strip()
+
+    def check_keyboard(self, data):
+        if data[6] == 0x01:
+            return 1
+        elif data[6] == 0x02:
+            return 2
+        elif data[6] == 0x04:
+            return 3
+        elif data[6] == 0x08:
+            return 4
+        elif data[6] == 0x10:
+            return 5
+        elif data[6] == 0x20:
+            return 6
+        elif data[6] == 0x40:
+            return 7
+        elif data[6] == 0x80:
+            return 8
+
+    def x_map(self, x):
+        if x < 512:
+            return 512 - 512 * (512 - x) / (512 - self.x_min)
+        if x > 512:
+            return 512 + 512 * (512 - x) / (512 - self.x_max)
+        return 512
+
+    def y_map(self, y):
+        if y < 512:
+            return 512 - 512 * (512 - y) / (512 - self.y_min)
+        if y > 512:
+            return 512 + 512 * (512 - y) / (512 - self.y_max)
+        return 512
+    
+    def z_map(self, z):
+        if z < 512:
+            return 512 - 512 * (512 - z) / (512 - self.z_min)
+        if z > 512:
+            return 512 + 512 * (512 - z) / (512 - self.z_max)
+        return 512
+
+    def update_position_from_device(self):
+        response = self.send_status_request()
+        if response.startswith('<'):
+            positions = self.parse_position_response(response)
+            self.update_position.emit(*positions)
+
+    def parse_position_response(self, response):
+        # The response should be in terms of '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000>'
+        mpos_start = response.find('MPos:') + len('MPos:')
+        mpos_end = response.find('|', mpos_start)
+        mpos_str = response[mpos_start:mpos_end]
+        mpos = list(map(float, mpos_str.split(',')))
+        self.x_pos, self.y_pos, self.z_pos = mpos
+        return self.x_pos, self.y_pos, self.z_pos
+
 
 class MainWidget(QWidget):
     evtCallback = pyqtSignal(int)
@@ -101,7 +311,7 @@ class MainWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(1024, 768)
+        self.setMinimumSize(1280, 800)
         self.hcam = None
         self.timer = QTimer(self)
         self.imgWidth = 0
@@ -112,8 +322,9 @@ class MainWidget(QWidget):
         self.tint = toupcam.TOUPCAM_TINT_DEF
         self.count = 0
         self.last_image = None
-        self.last_image_flag = 0 #Flag to monitor whether last_image is active
+        self.last_image_flag = 0  # Flag to monitor whether last_image is active
         self.focus_thread = None  # Initialize focus_thread attribute
+        self.position_worker = None
 
         gboxres = QGroupBox("Resolution")
         self.cmb_res = QComboBox()
@@ -168,6 +379,13 @@ class MainWidget(QWidget):
         self.btn_snap.clicked.connect(self.onBtnSnap)
         self.btn_focus = QPushButton("Focus")
         self.btn_focus.clicked.connect(self.onBtnFocus)
+        self.btn_homing = QPushButton("Homing")
+        self.btn_homing.clicked.connect(self.onHoming)
+        self.btn_kill_alarm = QPushButton("Kill Alarm")
+        self.btn_kill_alarm.clicked.connect(self.onKillAlarm)
+        self.btn_unlock_motor = QPushButton("Unlock Motor")
+        self.btn_unlock_motor.clicked.connect(self.onUnlockMotor)
+
         vlytctrl = QVBoxLayout()
         vlytctrl.addWidget(gboxres)
         vlytctrl.addWidget(gboxexp)
@@ -175,12 +393,19 @@ class MainWidget(QWidget):
         vlytctrl.addWidget(self.btn_open)
         vlytctrl.addWidget(self.btn_snap)
         vlytctrl.addWidget(self.btn_focus)
+        vlytctrl.addWidget(self.btn_homing)
+        vlytctrl.addWidget(self.btn_kill_alarm)
+        vlytctrl.addWidget(self.btn_unlock_motor)
         vlytctrl.addStretch()
         wgctrl = QWidget()
         wgctrl.setLayout(vlytctrl)
 
         self.lbl_frame = QLabel()
         self.lbl_video = QLabel()
+        self.lcd_position_x = QLCDNumber(self)
+        self.lcd_position_y = QLCDNumber(self)
+        self.lcd_position_z = QLCDNumber(self)
+
         vlytshow = QVBoxLayout()
         vlytshow.addWidget(self.lbl_video, 1)
         vlytshow.addWidget(self.lbl_frame)
@@ -190,8 +415,14 @@ class MainWidget(QWidget):
         gmain = QGridLayout()
         gmain.setColumnStretch(0, 1)
         gmain.setColumnStretch(1, 4)
-        gmain.addWidget(wgctrl)
-        gmain.addWidget(wgshow)
+        gmain.addWidget(wgctrl, 0, 0, 2, 1)
+        gmain.addWidget(wgshow, 0, 1, 1, 1)
+        gmain.addWidget(QLabel("Position X:"), 1, 1, 1, 1, Qt.AlignRight)
+        gmain.addWidget(self.lcd_position_x, 1, 2, 1, 1)
+        gmain.addWidget(QLabel("Position Y:"), 2, 1, 1, 1, Qt.AlignRight)
+        gmain.addWidget(self.lcd_position_y, 2, 2, 1, 1)
+        gmain.addWidget(QLabel("Position Z:"), 3, 1, 1, 1, Qt.AlignRight)
+        gmain.addWidget(self.lcd_position_z, 3, 2, 1, 1)
         self.setLayout(gmain)
 
         self.timer.timeout.connect(self.onTimer)
@@ -230,14 +461,14 @@ class MainWidget(QWidget):
         event.accept()
 
     def onResolutionChanged(self, index):
-        if self.hcam: #step 1: stop camera
+        if self.hcam:  # step 1: stop camera
             self.hcam.Stop()
 
         self.res = index
         self.imgWidth = self.cur.model.res[index].width
         self.imgHeight = self.cur.model.res[index].height
 
-        if self.hcam: #step 2: restart camera
+        if self.hcam:  # step 2: restart camera
             self.hcam.put_eSize(self.res)
             self.startCamera()
 
@@ -320,13 +551,18 @@ class MainWidget(QWidget):
                     self.cmb_res.addItem("{}*{}".format(self.cur.model.res[i].width, self.cur.model.res[i].height))
                 self.cmb_res.setCurrentIndex(self.res)
                 self.cmb_res.setEnabled(True)
-            self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0) #Qimage use RGB byte order
+            self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0)  # Qimage use RGB byte order
             self.hcam.put_AutoExpoEnable(1)
             self.startCamera()
+            # Start position worker
+            self.start_position_worker()
 
     def onBtnOpen(self):
         if self.hcam:
             self.closeCamera()
+            if self.position_worker is not None and self.position_worker.isRunning():
+                self.position_worker.running = False
+                self.position_worker.wait()
         else:
             arr = toupcam.Toupcam.EnumV2()
             if 0 == len(arr):
@@ -347,7 +583,7 @@ class MainWidget(QWidget):
 
     def onBtnSnap(self):
         if self.hcam:
-            if 0 == self.cur.model.still:    # not support still image capture
+            if 0 == self.cur.model.still:  # not support still image capture
                 if self.pData is not None:
                     image = QImage(self.pData, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
                     self.count += 1
@@ -360,13 +596,18 @@ class MainWidget(QWidget):
                     menu.addAction(action)
                 action = menu.exec(self.mapToGlobal(self.btn_snap.pos()))
                 self.hcam.Snap(action.data())
-    
+
     def onBtnFocus(self):
         if self.hcam:
             # 如果当前有运行中的线程，先停止它
             if self.focus_thread is not None and self.focus_thread.isRunning():
                 self.focus_thread.stop()
                 self.focus_thread.wait()
+
+            # 停止 HID 设备控制
+            if self.position_worker is not None and self.position_worker.isRunning():
+                self.position_worker.running = False
+                self.position_worker.wait()
 
             # 创建并启动新的Focus线程
             self.focus_thread = FocusThread(self)
@@ -377,63 +618,84 @@ class MainWidget(QWidget):
         print("Focus operation completed.")
         self.focus_thread = None  # Reset the thread variable
 
-    def rough_approach(self, first_step, threshold, n):
+        self.start_position_worker()
+
+    def onHoming(self):
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_homing_command()
+
+    def onKillAlarm(self):
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_reset_alarm()
+
+    def onUnlockMotor(self):
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.send_keep_on()
+
+    def climb_hill_focus(self, first_step, min_step, max_iteration):
         auto_focus = AutoFocus()
-        delta_u = first_step
-        u_real_max_min = float('inf')
-        rough_iteration_count = 0
-
-        while u_real_max_min >= threshold:
-            image1 = self.last_image.copy()
-            gray_image1 = auto_focus.rgb_to_gray(image1)
-
-            self.send_gcommand(f'$J=G91Z{delta_u}F30000\n')
-            print(f"Moving Z axis {delta_u} um")
-            time.sleep(0.5)
-
-            image2 = self.last_image.copy()
-            gray_image2 = auto_focus.rgb_to_gray(image2)
-
-            u_real_max_min = auto_focus.max_dfd(gray_image1, gray_image2, delta_u)
-            delta_u = u_real_max_min / n
-
-            rough_iteration_count += 1
-            print(f"Rough Iteration: {rough_iteration_count}, Delta U: {delta_u}")
-        
-        print(f"Rough Approach Finished, current Max DFD: {u_real_max_min:.6f} m")
-
-    def fine_approach(self, step_size, max_iteration):
-        auto_focus = AutoFocus()
-        FV_queue = np.zeros((3,), dtype=np.float32)
+        z_displacement = first_step
+        l_var = np.zeros((3,), dtype=np.float64)
+        count = 0
         direction = 1
-        flag = 0
 
         image = self.last_image.copy()
         gray_image = auto_focus.rgb_to_gray(image)
-        FV = auto_focus.calculate_FV(gray_image)
-        FV_queue[-1] = FV
+        l_var[-1] = auto_focus.laplacian_variance(gray_image)
+        print(f"Initial Laplacian Variance: {l_var[-1]:.6f}")
 
-        for i in range(max_iteration):
-            if not self.focus_thread.is_running:
-                break  # If the thread is stopped, break out of the loop
+        if self.hcam:
+            for i in range(max_iteration):
+                if not self.focus_thread.is_running:
+                    break
 
-            self.send_gcommand(f"$J=G91Z{step_size * direction}F31000\n")
-            time.sleep(0.5)
-            image = self.last_image.copy()
-            gray_image = auto_focus.rgb_to_gray(image)
-            FV = auto_focus.calculate_FV(gray_image)
-            if FV > FV_queue[-1] and FV_queue[-1] != 0:
-                direction = -direction
-            FV_queue[:-1] = FV_queue[1:]
-            FV_queue[-1] = FV
-            if FV_queue[0] > FV_queue[1] and FV_queue[1] < FV_queue[2] and FV_queue[1] != 0 and FV_queue[0] != 0:
-                flag = 1
-                break
-        
-        if flag == 1:
-            print(f"Fine Approach Finished")
-        else:
-            print(f"Fine Approach Failed, please change the parameters")
+                if direction == 1:
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement* 0.4}F30000\n')
+                else:
+                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                
+                time.sleep(0.3)
+
+                start_time = time.time()
+                image = self.last_image.copy()
+                gray_image = auto_focus.rgb_to_gray(image)
+                laplacian_variance = auto_focus.laplacian_variance(gray_image)
+                l_var[:-1] = l_var[1:]
+                l_var[-1] = laplacian_variance
+                print(f"Iteration: {i}, Laplacian Variance: {laplacian_variance:.6f}")
+                count += 1
+                end_time = time.time()
+                print(f"Time to calculate:{end_time-start_time:.6f}s")
+
+                if count == 1:
+                    if l_var[2] >= l_var[1]:
+                        print("first step direction correct")
+                    else:
+                        direction = - direction
+                        print("first step direction incorrect")
+                else:
+                    if l_var[1] >= l_var[0] and l_var[1] >= l_var[2]:
+                        if abs(z_displacement) > min_step:
+                            # self.send_gcommand(f'$J=G91Z{z_displacement}F30000\n')
+                            # time.sleep(0.3)
+                            # l_var[1], l_var[2] = l_var[2], l_var[1]
+                            direction = - direction
+                            z_displacement = z_displacement / 2
+                            print("go back with halved step")
+                            continue
+                        if abs(z_displacement) <= min_step:
+                            print(f"z_displacement = {z_displacement} um")
+                            if direction == 1:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement* 0.4}F30000\n')
+                            else:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                            print("Focus operation completed")
+                            return
+                    # elif l_var[2] < l_var[1]:
+                    #     direction = - direction
+                        continue
+                    else:
+                        continue
 
     @staticmethod
     def eventCallBack(nEvent, self):
@@ -467,10 +729,10 @@ class MainWidget(QWidget):
             image_copy = np.frombuffer(self.pData, dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3).copy()
             self.display_image(image_copy)
             self.last_image = image_copy
-            if (self.last_image is not None) and (self.last_image_flag == 0): #Check if it is activated
+            if (self.last_image is not None) and (self.last_image_flag == 0):  # Check if it is activated
                 print('Last image activated')
                 self.last_image_flag = 1
-            
+
     def display_image(self, image):
         qimage = QImage(image, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage)
@@ -498,7 +760,7 @@ class MainWidget(QWidget):
     def handleStillImageEvent(self):
         info = toupcam.ToupcamFrameInfoV3()
         try:
-            self.hcam.PullImageV3(None, 1, 24, 0, info) # peek
+            self.hcam.PullImageV3(None, 1, 24, 0, info)  # peek
         except toupcam.HRESULTException:
             pass
         else:
@@ -515,14 +777,28 @@ class MainWidget(QWidget):
 
     def send_gcommand(self, command, need_ret=True):
         if need_ret:
-            ser.read_all() # Make sure there is nothing to read
+            ser.read_all()  # Make sure there is nothing to read
 
         ser.write(command.encode())
-        
+
         if need_ret:
             ret = ser.readline()
-            print('command=',command, 'ret=', ret)
+            print('command=', command, 'ret=', ret)
             return ret
+
+    def start_position_worker(self):
+        if self.position_worker is not None and self.position_worker.isRunning():
+            self.position_worker.running = False
+            self.position_worker.wait()
+
+        self.position_worker = PositionWorker()
+        self.position_worker.update_position.connect(self.update_position)
+        self.position_worker.start()
+
+    def update_position(self, x, y, z):
+        self.lcd_position_x.display(x)
+        self.lcd_position_y.display(y)
+        self.lcd_position_z.display(z)
 
 
 if __name__ == '__main__':
