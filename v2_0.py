@@ -13,6 +13,7 @@ from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QCheckBox, QMessageBox, QPushButton, QComboBox, QSlider, QGroupBox, QGridLayout, QHBoxLayout, QVBoxLayout, QMenu, QAction, QLCDNumber, QLineEdit, QFileDialog, QListView, QInputDialog, QListView
 import os
 from scipy.fftpack import fft2, fftshift
+import cupy as cp
 
 ser = serial.Serial('COM3', 115200, timeout=1, write_timeout=5)
 
@@ -93,6 +94,9 @@ class AutoFocus:
         self.weight_matrix1 = None
         self.weight_matrix2 = None
         self.weight_matrix3 = None
+        self.weight_matrix12 = None
+        self.weight_matrix22 = None
+        self.weight_matrix32 = None
 
     def get_weight_matrix(self, M, N):
         u = np.arange(-M // 2, M // 2)
@@ -111,26 +115,80 @@ class AutoFocus:
         return laplacian.var()
 
     def fourier_sharpness(self, gray_image):
-        F_uv = fftshift(fft2(gray_image))
+        start_time = time.time()
+        gray_image_cp = cp.array(gray_image).astype(cp.float32)
+        
+        end_time = time.time()
+        print(f"Time elapsed for FFT: {end_time - start_time:.2f} s")
+        F_uv = fftshift(cp.asnumpy(cp.fft.fft2(gray_image_cp)))
         M, N = gray_image.shape
 
+        end_time = time.time()
+        print(f"Time elapsed for FFT: {end_time - start_time:.2f} s")
         if N == 4168:
             if self.weight_matrix1 is None:
                 self.weight_matrix1 = self.get_weight_matrix(6224, 4168)
-            weight_matrix = self.weight_matrix1
+            sharpness = np.sum(self.weight_matrix1 * np.abs(F_uv)) / (M * N)
         elif N == 2084:
             if self.weight_matrix2 is None:
                 self.weight_matrix2 = self.get_weight_matrix(3104, 2084)
-            weight_matrix = self.weight_matrix2
+            sharpness = np.sum(self.weight_matrix2 * np.abs(F_uv)) / (M * N)
         elif N == 1386:
             if self.weight_matrix3 is None:
                 self.weight_matrix3 = self.get_weight_matrix(2064, 1386)
-            weight_matrix = self.weight_matrix3
+            sharpness = np.sum(self.weight_matrix3 * np.abs(F_uv)) / (M * N)
         else:
             print("Image size not found")
             return None
 
-        sharpness = np.sum(weight_matrix * np.abs(F_uv)) / (M * N)
+        end_time = time.time()
+        print(f"Time elapsed for FFT: {end_time - start_time:.2f} s")
+        return sharpness
+    
+    
+    def fourier_sharpness_2n(self, gray_image):
+        start_time = time.time()
+        gray_image_cp = cp.array(gray_image).astype(cp.float32)
+        M, N = gray_image.shape
+
+        if N == 4168:
+            # The original size of gray_image_cp is 6224x4168, 6224 is the first dimension
+            # Only calculate the central part of gray_image_cp with size 4096 x 4096
+            gray_image_cp = gray_image_cp[1064:5160, 36:4132]
+            print(f"size of gray_image_cp: {gray_image_cp.shape}")
+
+        elif N == 2084:
+            # Same for image that has size 3104x2084, shrink to 2048 x 2048
+            gray_image_cp = gray_image_cp[528:2576, 28:2056]
+            print(f"size of gray_image_cp: {gray_image_cp.shape}")
+        elif N == 1386:
+            # Same for image that has size 2064x1386, shrink to 1024 x 1024
+            gray_image_cp = gray_image_cp[533:1557, 28:1052]
+            print(f"size of gray_image_cp: {gray_image_cp.shape}")
+        
+        F_uv = fftshift(cp.asnumpy(cp.fft.fft2(gray_image_cp)))
+        M, N = gray_image_cp.shape
+
+        end_time = time.time()
+        print(f"Time elapsed for FFT: {end_time - start_time:.2f} s")
+        if N == 4096:
+            if self.weight_matrix12 is None:
+                self.weight_matrix12 = self.get_weight_matrix(4096, 4096)
+            sharpness = np.sum(self.weight_matrix12 * np.abs(F_uv)) / (M * N)
+        elif N == 2048:
+            if self.weight_matrix22 is None:
+                self.weight_matrix22 = self.get_weight_matrix(2048, 2048)
+            sharpness = np.sum(self.weight_matrix22 * np.abs(F_uv)) / (M * N)
+        elif N == 1024:
+            if self.weight_matrix32 is None:
+                self.weight_matrix32 = self.get_weight_matrix(1024, 1024)
+            sharpness = np.sum(self.weight_matrix32 * np.abs(F_uv)) / (M * N)
+        else:
+            print("Image size not found")
+            return None
+
+        end_time = time.time()
+        print(f"Time elapsed for FFT: {end_time - start_time:.2f} s")
         return sharpness
     
 class FocusThread(QThread):
@@ -439,6 +497,8 @@ class MainWidget(QWidget):
         self.is_scanning = 0
         self.is_snapping = 0
 
+        self.stop_scanning = 0
+
         self.focus_thread = None  # Initialize focus_thread attribute
         self.position_worker = None # Initialize position_worker attribute
         self.scan_thread = None # Initialize scan_thread attribute
@@ -510,6 +570,8 @@ class MainWidget(QWidget):
         self.btn_end_point = QPushButton("End Point")
         self.btn_start_point.clicked.connect(self.set_start_point)
         self.btn_end_point.clicked.connect(self.set_end_point)
+        self.btn_stop_scan = QPushButton("Stop Scan")
+        self.btn_stop_scan.clicked.connect(self.stop_scan)
 
         vlytctrl = QVBoxLayout()
         vlytctrl.addWidget(gboxres)
@@ -522,6 +584,7 @@ class MainWidget(QWidget):
         vlytctrl.addWidget(self.btn_scan)
         vlytctrl.addWidget(self.btn_start_point)
         vlytctrl.addWidget(self.btn_end_point)
+        vlytctrl.addWidget(self.btn_stop_scan)
         vlytctrl.addStretch()
         wgctrl = QWidget()
         wgctrl.setLayout(vlytctrl)
@@ -538,7 +601,6 @@ class MainWidget(QWidget):
         vlytshow.addWidget(self.lbl_video, 1)
         vlytshow.addWidget(self.lbl_frame)
         vlytshow.addWidget(self.lbl_lvar)
-        vlytshow.addWidget(self.lbl_n_diff)
         wgshow = QWidget()
         wgshow.setLayout(vlytshow)
 
@@ -742,10 +804,38 @@ class MainWidget(QWidget):
                 self.position_worker.running = False
                 self.position_worker.wait()
 
+            focus_initial_step = [500.0, 160.0, 100.0, 25.0, 10.0]
+            focus_final_step = [50.0, 40.0, 20.0, 3.0, 1.0]
+
             # 创建并启动新的Focus线程
-            self.focus_thread = FocusThread(self, self.smooth_approach, 40.0, 10.0, 40)
-            self.focus_thread.finished.connect(self.onFocusFinished)
-            self.focus_thread.start()
+            menu = QMenu()
+            action1 = QAction("5x", self)
+            action1.setData(0)
+            menu.addAction(action1)
+
+            action2 = QAction("10x", self)
+            action2.setData(1)
+            menu.addAction(action2)
+
+            action3 = QAction("20x", self)
+            action3.setData(2)
+            menu.addAction(action3)
+            
+            action4 = QAction("50x", self)
+            action4.setData(3)
+            menu.addAction(action4)
+            
+            action5 = QAction("100x", self)
+            action5.setData(4)
+            menu.addAction(action5)
+
+            action = menu.exec(self.mapToGlobal(self.btn_focus.pos()))
+
+            if action:
+                print(f'Focus step size: {focus_initial_step[action.data()]} -> {focus_final_step[action.data()]}') 
+                self.focus_thread = FocusThread(self, self.smooth_approach, focus_initial_step[action.data()], focus_final_step[action.data()], 40)
+                self.focus_thread.finished.connect(self.onFocusFinished)
+                self.focus_thread.start()
 
     def onFocusFinished(self):
         print("Focus operation completed.")
@@ -862,7 +952,7 @@ class MainWidget(QWidget):
                 else:
                     self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
                 
-                time.sleep(0.3)
+                time.sleep(0.2)
                 
                 start_time = time.time()
                 gray_image = auto_focus.rgb_to_gray(self.last_image)
@@ -897,7 +987,7 @@ class MainWidget(QWidget):
                                 self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
                             else:
                                 self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
-                            time.sleep(0.3)
+                            time.sleep(0.1)
                             break
 
     def scan_capture(self,start_point, end_point):
@@ -937,6 +1027,9 @@ class MainWidget(QWidget):
 
         for i in range(self.nx + 1):
             for j in range(self.ny + 1):
+                if self.stop_scanning:
+                    self.stop_scanning = 0
+                    break 
                 self.send_gcommand(f'G0G90X{X[i][j]}Y{Y[i][j]}\n')
                 time.sleep(0.3)
                 # 在每个扫描点启动独立的聚焦线程
@@ -950,6 +1043,9 @@ class MainWidget(QWidget):
                 hresult = self.hcam.Snap(0)
                 print(f"Snap HRESULT: ",hresult)
                 self.scan_count += 1
+    
+    def stop_scan(self):
+        self.stop_scanning = 1
 
     def start_focus_thread(self, method, *args):
         # 创建一个新的聚焦线程，并运行指定的聚焦方法
@@ -1039,7 +1135,7 @@ class MainWidget(QWidget):
             #     min_n_gray_flat = heapq.nsmallest(n, gray_flat)
             #     self.n_diff = (np.sum(max_n_gray_flat) - np.sum(min_n_gray_flat))/100
                 # self.l_var = auto_focus.laplacian_variance(gray_image)
-            self.lbl_lvar.setText(f"Laplacian Variance: {self.l_var:.3f}")
+            self.lbl_lvar.setText(f"Sharpness: {self.l_var:.3f}")
             # self.lbl_n_diff.setText(f"N Difference: {self.n_diff:.3f}")
             if (self.last_image is not None) and (self.last_image_flag == 0):  # Check if it is activated
                 print('Last image activated')
