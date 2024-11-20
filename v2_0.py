@@ -7,13 +7,14 @@ import cv2
 import time
 import serial
 import math
+import heapq
 from PyQt5.QtCore import pyqtSignal, QTimer, Qt, QSignalBlocker, QThread
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QCheckBox, QMessageBox, QPushButton, QComboBox, QSlider, QGroupBox, QGridLayout, QHBoxLayout, QVBoxLayout, QMenu, QAction, QLCDNumber, QLineEdit, QFileDialog, QListView, QInputDialog, QListView
 import os
-from PIL import Image
+from scipy.fftpack import fft2, fftshift
 
-ser = serial.Serial('COM4', 115200, timeout=1, write_timeout=5)
+ser = serial.Serial('COM3', 115200, timeout=1, write_timeout=5)
 
 class ScanThread(QThread):
     def __init__(self, main_widget, start_point, end_point):
@@ -89,17 +90,49 @@ class SavePathDialog(QWidget):
 
 class AutoFocus:
     def __init__(self):
-        pass
+        self.weight_matrix1 = None
+        self.weight_matrix2 = None
+        self.weight_matrix3 = None
+
+    def get_weight_matrix(self, M, N):
+        u = np.arange(-M // 2, M // 2)
+        v = np.arange(-N // 2, N // 2)
+        U, V = np.meshgrid(v, u)
+        weight_matrix = np.sqrt(U**2 + V**2)
+        return weight_matrix
 
     def rgb_to_gray(self, image):
         gray_image = np.dot(image[..., :3], [38, 75, 15]) >> 7
         return gray_image.astype(np.uint8)
-
+    
     def laplacian_variance(self, gray_image):
         """Calculate the variance of the Laplacian, which indicates the sharpness of the image."""
         laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
         return laplacian.var()
 
+    def fourier_sharpness(self, gray_image):
+        F_uv = fftshift(fft2(gray_image))
+        M, N = gray_image.shape
+
+        if N == 4168:
+            if self.weight_matrix1 is None:
+                self.weight_matrix1 = self.get_weight_matrix(6224, 4168)
+            weight_matrix = self.weight_matrix1
+        elif N == 2084:
+            if self.weight_matrix2 is None:
+                self.weight_matrix2 = self.get_weight_matrix(3104, 2084)
+            weight_matrix = self.weight_matrix2
+        elif N == 1386:
+            if self.weight_matrix3 is None:
+                self.weight_matrix3 = self.get_weight_matrix(2064, 1386)
+            weight_matrix = self.weight_matrix3
+        else:
+            print("Image size not found")
+            return None
+
+        sharpness = np.sum(weight_matrix * np.abs(F_uv)) / (M * N)
+        return sharpness
+    
 class FocusThread(QThread):
     finished = pyqtSignal()
 
@@ -128,9 +161,9 @@ class PositionWorker(QThread):
         self.x_pos = 0.0
         self.y_pos = 0.0
         self.z_pos = 0.0
-        self.flag = 0  # 用于控制键盘输入的状态
+        self.flag = 0
         self.home = 0
-        self.alarmed = 0  # True if the system becomes in alarm status. Need to press button to reset
+        self.alarmed = 0
         self.cancel = 0
         self.move = 0
         self.x_min = 2
@@ -359,9 +392,10 @@ class PositionWorker(QThread):
         mpos_end = response.find('|', mpos_start)
         mpos_str = response[mpos_start:mpos_end]
         mpos = list(map(float, mpos_str.split(',')))
+        while len(mpos) < 3:
+            mpos.append('0')  # 或者其他默认值
         self.x_pos, self.y_pos, self.z_pos = mpos
         return self.x_pos, self.y_pos, self.z_pos
-
 
 class MainWidget(QWidget):
     evtCallback = pyqtSignal(int)
@@ -399,6 +433,11 @@ class MainWidget(QWidget):
         self.last_image_flag = 0  # Flag to monitor whether last_image is active
         self.scan = 0
         self.scan_count = None
+        self.l_var = 0
+        self.lvar_refresh_count = 0
+        self.n_diff = 0
+        self.is_scanning = 0
+        self.is_snapping = 0
 
         self.focus_thread = None  # Initialize focus_thread attribute
         self.position_worker = None # Initialize position_worker attribute
@@ -406,6 +445,10 @@ class MainWidget(QWidget):
 
         self.start_point = None
         self.end_point = None
+
+        self.scan_step_x = [4.8, 2.4, 1.2]
+        self.scan_step_y = [3.2, 1.6, 0.8]
+
 
         gboxres = QGroupBox("Resolution")
         self.cmb_res = QComboBox()
@@ -455,6 +498,8 @@ class MainWidget(QWidget):
 
         self.btn_open = QPushButton("Open")
         self.btn_open.clicked.connect(self.onBtnOpen)
+        self.btn_snap = QPushButton("Snap")
+        self.btn_snap.clicked.connect(self.onBtnSnap)
         self.btn_focus = QPushButton("Focus")
         self.btn_focus.clicked.connect(self.onBtnFocus)
         self.btn_homing = QPushButton("Homing")
@@ -471,6 +516,7 @@ class MainWidget(QWidget):
         vlytctrl.addWidget(gboxexp)
         vlytctrl.addWidget(gboxwb)
         vlytctrl.addWidget(self.btn_open)
+        vlytctrl.addWidget(self.btn_snap)
         vlytctrl.addWidget(self.btn_focus)
         vlytctrl.addWidget(self.btn_homing)
         vlytctrl.addWidget(self.btn_scan)
@@ -481,6 +527,8 @@ class MainWidget(QWidget):
         wgctrl.setLayout(vlytctrl)
 
         self.lbl_frame = QLabel()
+        self.lbl_lvar = QLabel()
+        self.lbl_n_diff = QLabel()
         self.lbl_video = QLabel()
         self.lcd_position_x = QLCDNumber(self)
         self.lcd_position_y = QLCDNumber(self)
@@ -489,6 +537,8 @@ class MainWidget(QWidget):
         vlytshow = QVBoxLayout()
         vlytshow.addWidget(self.lbl_video, 1)
         vlytshow.addWidget(self.lbl_frame)
+        vlytshow.addWidget(self.lbl_lvar)
+        vlytshow.addWidget(self.lbl_n_diff)
         wgshow = QWidget()
         wgshow.setLayout(vlytshow)
 
@@ -511,6 +561,7 @@ class MainWidget(QWidget):
     def onTimer(self):
         if self.hcam:
             nFrame, nTime, nTotalFrame = self.hcam.get_FrameRate()
+            print(nFrame, nTime, nTotalFrame)
             self.lbl_frame.setText("{}, fps = {:.1f}".format(nTotalFrame, nFrame * 1000.0 / nTime))
 
     def closeCamera(self):
@@ -620,6 +671,7 @@ class MainWidget(QWidget):
     def openCamera(self):
         self.hcam = toupcam.Toupcam.Open(self.cur.id)
         if self.hcam:
+            self.hcam.put_RealTime(1)
             self.res = self.hcam.get_eSize()
             self.imgWidth = self.cur.model.res[self.res].width
             self.imgHeight = self.cur.model.res[self.res].height
@@ -631,6 +683,8 @@ class MainWidget(QWidget):
                 self.cmb_res.setEnabled(True)
             self.hcam.put_Option(toupcam.TOUPCAM_OPTION_BYTEORDER, 0)  # Qimage use RGB byte order
             self.hcam.put_AutoExpoEnable(1)
+            self.lbl_lvar.setText("Laplacian Variance: 0")
+            self.lbl_n_diff.setText("Normalized Difference: 0")
             self.startCamera()
             # Start position worker
             self.start_position_worker()
@@ -659,6 +713,24 @@ class MainWidget(QWidget):
                     self.cur = arr[action.data()]
                     self.openCamera()
 
+    def onBtnSnap(self):
+        if self.hcam:
+            if 0 == self.cur.model.still:    # not support still image capture
+                if self.pData is not None:
+                    image = QImage(self.pData, self.imgWidth, self.imgHeight, QImage.Format_RGB888)
+                    self.count += 1
+                    image.save("pyqt{}.jpg".format(self.count))
+            else:
+                menu = QMenu()
+                for i in range(0, self.cur.model.still):
+                    action = QAction("{}*{}".format(self.cur.model.res[i].width, self.cur.model.res[i].height), self)
+                    action.setData(i)
+                    menu.addAction(action)
+                action = menu.exec(self.mapToGlobal(self.btn_snap.pos()))
+                hresult = self.hcam.Snap(action.data())
+                print(f"Snap HRESULT: ", action.data(), hresult)
+                self.is_snapping = 1
+
     def onBtnFocus(self):
         if self.hcam:
             # 如果当前有运行中的线程，先停止它
@@ -671,7 +743,7 @@ class MainWidget(QWidget):
                 self.position_worker.wait()
 
             # 创建并启动新的Focus线程
-            self.focus_thread = FocusThread(self, self.smooth_approach, 50.0, 20.0, 20)
+            self.focus_thread = FocusThread(self, self.smooth_approach, 40.0, 10.0, 40)
             self.focus_thread.finished.connect(self.onFocusFinished)
             self.focus_thread.start()
 
@@ -767,15 +839,18 @@ class MainWidget(QWidget):
     def smooth_approach(self, first_step, final_step, max_iterations):
         auto_focus = AutoFocus()
         z_displacement = first_step
-        l_var = np.zeros((3,), dtype=np.float64)
+        sharpness = np.zeros((3,), dtype=np.float64)
         count = 0
         direction = 1
         find_peak = 0
         positive_multiplier = 0.4
+        f_sharpness = 0
 
         gray_image = auto_focus.rgb_to_gray(self.last_image)
-        l_var[-1] = auto_focus.laplacian_variance(gray_image)
-        print(f"Initial Laplacian Variance: {l_var[-1]:.6f}")
+
+        sharpness[-1] = auto_focus.fourier_sharpness(gray_image)
+        
+        print(f"Initial Sharpness: {sharpness[-1]:.6f}")
 
         if self.hcam:
             for i in range(max_iterations):
@@ -791,22 +866,25 @@ class MainWidget(QWidget):
                 
                 start_time = time.time()
                 gray_image = auto_focus.rgb_to_gray(self.last_image)
-                laplacian_variance = auto_focus.laplacian_variance(gray_image)
-                l_var[:-1] = l_var[1:]
-                l_var[-1] = laplacian_variance
-                print(f"Iteration: {i}, Laplacian Variance: {laplacian_variance:.6f}")
+
+                f_sharpness = auto_focus.fourier_sharpness(gray_image)
+                
+                sharpness[:-1] = sharpness[1:]
+                sharpness[-1] = f_sharpness
+                
+                print(f"Iteration: {i}, Sharpness Value: {f_sharpness:.6f}")
                 count += 1
                 end_time = time.time()
                 print(f"Time elapsed: {end_time - start_time:.2f} s")
 
                 if count == 1:
-                    if l_var[2] >= l_var[1]:
+                    if sharpness[2] >= sharpness[1]:
                         print("first step direction correct")
                     else:
                         direction = - direction
                         print("first step direction incorrect")
                 else:
-                    if l_var[1] >= l_var[0] and l_var[1] >= l_var[2]:
+                    if sharpness[1] >= sharpness[0] and sharpness[1] >= sharpness[2]:
                         if find_peak == 0:    
                             direction = - direction
                             z_displacement = final_step
@@ -814,13 +892,12 @@ class MainWidget(QWidget):
                             print('Slowly go back towards the peak')
                         else:
                             print('This is good enough though')
-                            direction = - direction
-                            for _ in range(2):    
-                                if direction == 1:
-                                    self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
-                                else:
-                                    self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
-                                time.sleep(0.3)
+                            direction = - direction 
+                            if direction == 1:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement * positive_multiplier}F30000\n')
+                            else:
+                                self.send_gcommand(f'$J=G91Z{direction * z_displacement}F30000\n')
+                            time.sleep(0.3)
                             break
 
     def scan_capture(self,start_point, end_point):
@@ -839,10 +916,10 @@ class MainWidget(QWidget):
         if start_y > end_y:
             start_y, end_y = end_y, start_y
 
-        step_size_x = 0.48
-        step_size_y = 0.32
+        step_size_x = self.scan_x
+        step_size_y = self.scan_y
 
-        self.save_count = 0
+        self.scan_count = 0
         print('Start Scanning...')
 
         self.nx = math.ceil((end_x - start_x) / step_size_x)
@@ -860,21 +937,19 @@ class MainWidget(QWidget):
 
         for i in range(self.nx + 1):
             for j in range(self.ny + 1):
-                self.send_gcommand(f'G0G90X{X[i]:.3f}Y{Y[j]:.3f}\n')
+                self.send_gcommand(f'G0G90X{X[i][j]}Y{Y[i][j]}\n')
                 time.sleep(0.3)
                 # 在每个扫描点启动独立的聚焦线程
                 if j == 0:
-                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
+                    self.start_focus_thread('smooth_approach', 100.0, 30.0, 20)
                 else:
-                    self.start_focus_thread('smooth_approach', 100.0, 50.0, 20)
+                    self.start_focus_thread('smooth_approach', 50.0, 20.0, 20)
                 
                 self.focus_thread.wait()
-                self.onResolutionChanged(self, 0)
-                image_pillow = Image.fromarray(self.last_image)
-                file_name = f'{i+1}_{j+1}.jpg'
-                file_path = os.path.join(self.picture_save_folder, file_name)
-                image_pillow.save(file_path, 'JPEG', quality = 85)
-                self.onResolutionChanged(self, 1)
+                time.sleep(0.3)
+                hresult = self.hcam.Snap(0)
+                print(f"Snap HRESULT: ",hresult)
+                self.scan_count += 1
 
     def start_focus_thread(self, method, *args):
         # 创建一个新的聚焦线程，并运行指定的聚焦方法
@@ -892,6 +967,21 @@ class MainWidget(QWidget):
         self.focus_thread.start()
     
     def show_save_path_dialog(self):
+        menu = QMenu()
+        action1 = QAction("5x", self)
+        action2 = QAction("10x", self)
+        action3 = QAction("20x", self)
+        action1.setData(1)
+        action2.setData(2)
+        action3.setData(3)
+        menu.addAction(action1)
+        menu.addAction(action2)
+        menu.addAction(action3)
+        action = menu.exec(self.mapToGlobal(self.btn_scan.pos()))
+        if action:
+            self.scan_x = self.scan_step_x[action.data() - 1]
+            self.scan_y = self.scan_step_y[action.data() - 1]
+        print(f"Scan step size: x {self.scan_x} mm, y {self.scan_y} mm")
         self.dialog = SavePathDialog(self)
         self.dialog.show()
     
@@ -927,15 +1017,30 @@ class MainWidget(QWidget):
                 QMessageBox.warning(self, "Warning", "Camera disconnect.")
 
     def handleImageEvent(self):
+        auto_focus = AutoFocus()
         try:
             self.hcam.PullImageV3(self.pData, 0, 24, 0, None)
         except toupcam.HRESULTException:
             pass
         else:
+            self.lvar_refresh_count += 1
             image_copy = np.frombuffer(self.pData, dtype=np.uint8).reshape(self.imgWidth, self.imgHeight, 3).copy()
             self.display_image(image_copy)
+            n = 100
             self.last_image = None
             self.last_image = image_copy
+            if self.lvar_refresh_count == 30:
+                self.lvar_refresh_count = 0
+                gray_image = auto_focus.rgb_to_gray(self.last_image)
+                self.l_var = auto_focus.fourier_sharpness(gray_image)
+
+            #     gray_flat = gray_image.flatten()
+            #     max_n_gray_flat = heapq.nlargest(n, gray_flat)
+            #     min_n_gray_flat = heapq.nsmallest(n, gray_flat)
+            #     self.n_diff = (np.sum(max_n_gray_flat) - np.sum(min_n_gray_flat))/100
+                # self.l_var = auto_focus.laplacian_variance(gray_image)
+            self.lbl_lvar.setText(f"Laplacian Variance: {self.l_var:.3f}")
+            # self.lbl_n_diff.setText(f"N Difference: {self.n_diff:.3f}")
             if (self.last_image is not None) and (self.last_image_flag == 0):  # Check if it is activated
                 print('Last image activated')
                 self.last_image_flag = 1
@@ -966,48 +1071,78 @@ class MainWidget(QWidget):
         with QSignalBlocker(self.slider_temp):
             self.slider_temp.setValue(nTemp)
         with QSignalBlocker(self.slider_tint):
-            self.slider_tint.setValue(nTint)
+            self.slider_tint.setValue(nTint)    
         self.lbl_temp.setText(str(nTemp))
         self.lbl_tint.setText(str(nTint))
 
     def handleStillImageEvent(self):
-        if self.scan:
-            info = toupcam.ToupcamFrameInfoV3()
-            self.save_count += 1
-            
-            try:
-                if info.width > 0 and info.height > 0:
-                    buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
-                    try:
-                        self.hcam.PullImageV3(buf, 1, 24, 0, info)
-                    except toupcam.HRESULTException:
-                        pass
-                    else:
-                        # 将图像数据转换为 NumPy 数组，并重塑为适当的形状
-                        image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgHeight, self.imgWidth, 3)
-                        
-                        # 将 NumPy 数组转换为 Pillow 图像对象
-                        image_pillow = Image.fromarray(image)
-
-                        print(f'{self.save_count} pictures saved')
-
-                        # 计算文件名并保存
-                        j, i = divmod(self.save_count, self.nx)
+        info = toupcam.ToupcamFrameInfoV3()
+        try:
+            self.hcam.PullImageV3(None, 1, 24, 0, info) # peek
+        except toupcam.HRESULTException:
+            pass
+        else:
+            if info.width > 0 and info.height > 0:
+                buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
+                try:
+                    self.hcam.PullImageV3(buf, 1, 24, 0, info)
+                except toupcam.HRESULTException:
+                    pass
+                else:
+                    image = QImage(buf, info.width, info.height, QImage.Format_RGB888)
+                    if self.is_snapping:
+                        self.is_snapping = 0
+                        image.save("snap{}.jpg".format(self.count))
+                    if self.scan:
+                        j, i = divmod(self.scan_count, self.nx)
                         j += 1
                         if i == 0:
                             i = self.nx
-                        file_name = f'{i+1}_{j+1}.jpg'
+                        file_name = f'{i}_{j}.jpg'
                         file_path = os.path.join(self.picture_save_folder, file_name)
+                        image.save(file_path)
+                    # self.count += 1
+                    # image.save("pyqt{}.jpg".format(self.count))
 
-                        # 使用 Pillow 保存图像
-                        try:
-                            image_pillow.save(file_path)
-                            print(f"Image saved at {file_path}")
-                        except Exception as e:
-                            print(f"Failed to save image: {e}")
+
+    # def handleStillImageEvent(self):
+    #     if self.scan:
+    #         info = toupcam.ToupcamFrameInfoV3()
+    #         self.save_count += 1
+            
+    #         try:
+    #             if info.width > 0 and info.height > 0:
+    #                 buf = bytes(toupcam.TDIBWIDTHBYTES(info.width * 24) * info.height)
+    #                 try:
+    #                     self.hcam.PullImageV3(buf, 1, 24, 0, info)
+    #                 except toupcam.HRESULTException:
+    #                     pass
+    #                 else:
+    #                     # 将图像数据转换为 NumPy 数组，并重塑为适当的形状
+    #                     image = np.frombuffer(buf, dtype=np.uint8).reshape(self.imgHeight, self.imgWidth, 3)
+                        
+    #                     # 将 NumPy 数组转换为 Pillow 图像对象
+    #                     image_pillow = Image.fromarray(image)
+
+    #                     print(f'{self.save_count} pictures saved')
+
+    #                     # 计算文件名并保存
+    #                     j, i = divmod(self.save_count, self.nx)
+    #                     j += 1
+    #                     if i == 0:
+    #                         i = self.nx
+    #                     file_name = f'{i+1}_{j+1}.jpg'
+    #                     file_path = os.path.join(self.picture_save_folder, file_name)
+
+    #                     # 使用 Pillow 保存图像
+    #                     try:
+    #                         image_pillow.save(file_path)
+    #                         print(f"Image saved at {file_path}")
+    #                     except Exception as e:
+    #                         print(f"Failed to save image: {e}")
                             
-            except toupcam.HRESULTException:
-                pass
+    #         except toupcam.HRESULTException:
+    #             pass
 
     def send_gcommand(self, command, need_ret=True):
         if need_ret:
